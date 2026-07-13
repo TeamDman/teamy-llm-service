@@ -1,0 +1,22 @@
+[package]
+name = "teamy_llm_cli"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "teamy-llm"
+path = "src/main.rs"
+
+[dependencies]
+color-eyre.workspace = true
+eyre.workspace = true
+humantime.workspace = true
+teamy_llm_core.workspace = true
+teamy_llm_service = { workspace = true, features = ["vox"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true

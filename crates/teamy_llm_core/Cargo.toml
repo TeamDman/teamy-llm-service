@@ -1,0 +1,12 @@
+[package]
+name = "teamy_llm_core"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+arbitrary.workspace = true
+facet.workspace = true
