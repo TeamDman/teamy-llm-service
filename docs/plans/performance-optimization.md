@@ -24,9 +24,9 @@ then append comparable release measurements to `PERFORMANCE_BASELINES.md` for la
 
 ## Scope
 
-**In scope for the current iteration:** profile and, if the profile confirms the present hypothesis,
-replace the default hybrid decoder's host-resident per-token work with GPU-resident decode state and
-GPU token selection.
+**In scope for the current iteration:** close the rejected CUDA lm-head argmax experiment with its
+profile, correctness, and benchmark evidence. The next code change is intentionally not selected
+until a new profiling decision closes a fresh iteration.
 
 **Out of scope for the current iteration:** changing the model, quantization, prompt contract, Vox
 API, CUDA-version policy, concurrency model, or planning subsequent optimization ideas. No CPU
@@ -67,14 +67,14 @@ non-default correctness oracles.
 - A GPU-resident implementation can match the current hybrid path's generated token IDs for the
   fixed benchmark and focused fixtures.
 
-## Decision gate before implementation
+## Decision gate — closed for iteration 1
 
 | Question | Required decision | Acceptance consequence |
 | --- | --- | --- |
-| Dominant decode work | Use a 64-token Tracy capture to name the highest exclusive CPU zones and confirm that host conversion, CPU attention/recurrent math, or host argmax dominates. | If the capture contradicts the hypothesis, revise the current iteration before editing the decoder. |
-| Correctness oracle | Choose and record a small fixed prompt/token-ID fixture plus a real-model comparison path before replacing the current decoder. | New GPU decode must match the oracle; a throughput gain with token drift is not accepted. |
-| Bounded implementation slice | Decide whether one slice can keep hidden state, full-attention K/V state, linear-attention recurrence, and lm-head argmax on CUDA together. If not, choose the smallest independently correct subset. | The plan names one slice and one prediction before code changes begin. |
-| Expected gain | Record a conservative prediction against the 4.811 tok/s direct baseline: **2–4× decode throughput (9.6–19.2 tok/s)** is the initial hypothesis. | Benchmark results are classified as met, partially met, or missed; a miss triggers diagnosis rather than silent scope expansion. |
+| Dominant decode work | Closed: the 64-token capture ranks `llm_burn_tensor_to_vec_f32` first and `llm_burn_lm_head_scan` third. | The first change targets only lm-head logits/argmax; host-resident decoder-state work remains a later decision. |
+| Correctness oracle | Closed: a 16-token direct, no-system-prompt oracle is recorded under item 1.3. | New CUDA argmax must emit the same IDs in the same order. |
+| Bounded implementation slice | Closed: keep the existing hybrid decoder state and replace only full-logit host extraction and host argmax with CUDA argmax plus scalar ID retrieval. | No attention, linear recurrence, prompt, Vox, or cache behavior changes belong in this slice. |
+| Expected gain | Closed: target **at least 1.5× direct decode throughput (>= 7.2 tok/s)**. | Benchmark results are classified as met, partially met, or missed; a miss triggers diagnosis rather than silent scope expansion. |
 
 ## Source and implementation references
 
@@ -98,7 +98,7 @@ non-default correctness oracles.
 5. Validate, benchmark, and append data.
 6. Close this iteration; begin the next one at step 1 rather than extending this scope.
 
-## Iteration 1 — GPU-resident hybrid decode
+## Iteration 1 — CUDA lm-head argmax
 
 ### [x] 1.1 Establish comparable benchmarks, baseline storage, and profiling capability
 
@@ -122,7 +122,7 @@ CPU profiling capture without changing the normal feature set.
 `100fd7d` added localhost-only Tracy profiling. The two feature-enabled validation commands passed
 on 2026-07-13. The source tree was clean after `100fd7d`.
 
-### [~] 1.2 Capture and summarize the current decode profile
+### [x] 1.2 Capture and summarize the current decode profile
 
 **Work:**
 
@@ -147,17 +147,16 @@ G:\Programming\Repos\teamy-profiler\target\release\teamy-profiler.exe tracy csv 
 **Completion criteria:** A saved capture and its CPU-zone summary identify the observed dominant
 host work during a reproducible direct decode run.
 
-### [ ] 1.3 Close the implementation slice and performance prediction
+**Completion notes:** Capture `C:\Users\Teamy\Documents\Codex\2026-07-13\that\teamy-llm-profile\direct-64_2026-07-13_23-43-17.tracy` was recorded with the listed release command on 2026-07-13. Its direct result was 35.612 s TTFT, 49.107 s completion, and 4.743 tok/s for 64 tokens, consistent with the 200-token baseline. `teamy-profiler tracy csv export ... --top 25 --table` reported `llm_burn_tensor_to_vec_f32{rank=3}` as the largest self-time (13.847 s across 12,034 calls), `llm_burn_lm_head_scan` as 5.158 s across 64 calls, and `llm_burn_tensor_to_vec_f32{rank=1}` as 3.216 s across 153 calls. These results support avoiding host tensor extraction and host lm-head argmax first.
+
+### [x] 1.3 Close the implementation slice and performance prediction
 
 **Work:**
 
 - Record the capture-supported bottleneck and the exact functions/state affected.
-- Choose a single bounded change. The expected choice is CUDA-resident hidden state, full-attention
-  K/V state, linear-attention recurrent state, and lm-head argmax for the default hybrid loop, but
-  do not start it unless item 1.2 supports it.
-- Capture a small token-ID oracle from the unchanged implementation and state its prompt, token
-  cap, model artifact, and expected IDs or comparison procedure.
-- Confirm or revise the 2–4× throughput prediction and state the acceptance threshold.
+- Choose the first bounded change supported by the capture.
+- Capture a small token-ID oracle from the unchanged implementation.
+- Record the prediction and acceptance threshold before production decoder code changes.
 
 **Validation:**
 
@@ -168,20 +167,21 @@ cargo run --release -p teamy_llm_cli -- benchmark --no-thinking --max-new-tokens
 **Completion criteria:** The next code change, correctness oracle, and measurable target are
 written here before production decoder code changes.
 
-### [ ] 2.1 Implement the selected GPU-resident decode slice
+**Completion notes:** The selected slice is CUDA lm-head argmax only: preserve the existing hybrid decoder state and move full-logit reduction/argmax from `greedy_next_token_from_hidden_tensor` to CUDA, returning only the chosen token ID to the host. The unchanged release oracle used no system prompt, direct mode, `Why is the sky blue?`, a 16-token cap, and the managed `qwopus-3.5-9b-coder-q4-k-m` artifact. Its IDs were `[760, 12515, 7701, 6105, 15048, 4016, 310, 264, 24057, 2512, 2972, 28232, 60845, 69377, 159034, 271]`. The profile shows 5.158 s of lm-head host-scan self time over the 13.495 s post-first-token interval; the conservative target is >= 7.2 tok/s (1.5× the 4.811 tok/s baseline), not the earlier whole-decoder 2–4× hypothesis.
+
+### [x] 2.1 Prototype and reject CUDA lm-head argmax
 
 **Work:**
 
-- Change only the default `Hybrid` production path selected by item 1.3.
-- Keep tensors and recurrent decode state on the CUDA device through decoder layers; avoid
-  `tensor_to_vec_f32`/`to_data()` in the per-token default path except for the minimum scalar data
-  required to stream the selected token.
-- Perform greedy token selection on CUDA when supported, rather than copying a complete logits
-  vector to the host.
+- Change only the default `Hybrid` production path's lm-head selection selected by item 1.3.
+- Add a CUDA tensor argmax/reduction path that accepts the already-device-resident final hidden
+  state and avoids copying a complete logits vector to the host.
+- Transfer only the selected token ID or the smallest equivalent scalar result needed for token
+  streaming.
 - Preserve cancellation checks, timeout accounting, token streaming, model runtime caching, and the
   direct/thinking public contract.
-- Keep existing full/incremental paths explicitly diagnostic rather than silently becoming a CPU
-  production fallback.
+- Do not change attention, linear recurrence, decode-state representation, or existing diagnostic
+  modes in this slice.
 
 **Validation:**
 
@@ -191,40 +191,52 @@ cargo test -p teamy_llm_burn_qwen35
 cargo test -p teamy_llm_cli
 ```
 
-**Completion criteria:** The selected decode path is CUDA-resident to the extent declared in item
-1.3, preserves the recorded oracle, and does not create a normal CPU inference fallback.
+**Completion criteria:** The prototype either meets its performance target while preserving the
+oracle, or is removed with an evidence-backed rejection before another change is attempted.
 
-### [ ] 3.1 Prove correctness and measure the result
+**Completion notes:** The prototype replaced the host logits vector/max scan with Burn
+`Tensor::argmax(2)`, then copied only its scalar integer result. A focused CPU-backend test and
+`cargo test -p teamy_llm_burn_qwen35` passed (24 passed, 1 ignored). The real CUDA 16-token oracle
+matched exactly. The implementation was removed after item 3.1 measured a throughput regression;
+the production source therefore remains on the prior host-scan path.
+
+### [x] 3.1 Prove correctness and measure the result
 
 **Work:**
 
-- Add the smallest focused tests that prove the new tensor-state/argmax behavior and token parity.
-- Run the current workspace checks and the ignored CUDA-contract test on the configured GPU host.
+- Run a focused unit test for the argmax reduction and the real GPU token-ID oracle.
 - Run separate process-cold direct and thinking 200-token release benchmarks. Append one row per
   completed run to `PERFORMANCE_BASELINES.md`, including datetime, mode, commit, model, token cap,
   cache state, and whether generation ended at the cap or EOS.
 - Compare measured throughput and TTFT with the prediction in item 1.3. If the target is missed,
-  document the profile evidence and stop this iteration rather than adding an unplanned fix.
+  remove the prototype, document the profile evidence, and stop this iteration rather than adding
+  an unplanned fix.
 
 **Validation:**
 
 ```pwsh
-cargo test --workspace
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test -p teamy_llm_burn_qwen35 installed_cuda_runtime_matches_contract_when_cuda_path_is_configured -- --ignored
+cargo test -p teamy_llm_burn_qwen35
 cargo run --release -p teamy_llm_cli -- benchmark --no-thinking --max-new-tokens 200 --timeout-ms 600000
 cargo run --release -p teamy_llm_cli -- benchmark --thinking --max-new-tokens 200 --timeout-ms 600000
 ```
 
-**Completion criteria:** Correctness evidence, clean validation, and appended comparable metrics
-show whether the predicted performance change was met.
+**Completion criteria:** Focused correctness evidence and appended comparable metrics show whether
+the predicted performance change was met; a rejected prototype is removed before the item closes.
 
-### [ ] 4.1 Close the iteration and seed only the next one
+**Completion notes:** The direct process-cold result was 39.541 s TTFT, 88.466 s completion, and
+4.088 tok/s. The thinking result was 42.133 s TTFT, 89.392 s completion, and 4.232 tok/s. Both are
+below their 4.811/4.804 tok/s baselines and miss the >= 7.2 tok/s target, despite exact 16-token
+oracle parity. Both rows were appended to `PERFORMANCE_BASELINES.md`. The hypothesis is rejected:
+the Burn/CUDA argmax plus scalar synchronization is slower than the existing host scan on this
+model and driver.
+
+### [x] 4.1 Close the rejected iteration and seed only the next one
 
 **Work:**
 
 - Mark the prior items complete with their commands, commit IDs, profile facts, and benchmark rows.
-- State the measured conclusion and whether the prediction was met, partially met, or missed.
+- State the measured conclusion and that the prediction was missed; retain no production code from
+  the rejected experiment.
 - Begin a new bounded iteration at item 1.2 only after a new profile identifies the next bottleneck;
   do not pre-populate its implementation tasks yet.
 
@@ -235,7 +247,13 @@ git status --short
 ```
 
 **Completion criteria:** The repository is clean, the completed iteration is self-explanatory, and
-the first unfinished task is a fresh profiling decision rather than speculative implementation.
+the next iteration begins only with a fresh profiling decision rather than speculative
+implementation.
+
+**Completion notes:** The CUDA argmax source and its temporary unit test were removed after the
+regression. The append-only baseline log retains both failed measurements, and this plan retains the
+capture, oracle, target, and rejection rationale. No next implementation slice is preselected; the
+next safe action is a new profile-driven decision.
 
 ## Overall completion criteria for an iteration
 

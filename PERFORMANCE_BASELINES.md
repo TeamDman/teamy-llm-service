@@ -7,6 +7,8 @@ row for every completed benchmark run; do not overwrite earlier measurements.
 | --- | --- | ---: | ---: | ---: | --- |
 | 2026-07-13T23:08:53-04:00 | direct | 43.263 | 84.837 | 4.811 | Release build, process-cold, `Why is the sky blue?`, 200-token cap, commit `5605696`. Timestamp recorded when this log was created immediately after the measurement. |
 | 2026-07-13T23:08:53-04:00 | thinking | 40.846 | 82.476 | 4.804 | Release build, process-cold, `Why is the sky blue?`, 200-token cap, commit `5605696`. Timestamp recorded when this log was created immediately after the measurement. |
+| 2026-07-14T00:01:53-04:00 | direct | 39.541 | 88.466 | 4.088 | Release build, process-cold, `Why is the sky blue?`, 200-token cap. CUDA lm-head argmax experiment based on `2e4b4cb`; token oracle matched but the implementation was reverted after this regression. Timestamp logged shortly after the run. |
+| 2026-07-14T00:01:53-04:00 | thinking | 42.133 | 89.392 | 4.232 | Release build, process-cold, `Why is the sky blue?`, 200-token cap. CUDA lm-head argmax experiment based on `2e4b4cb`; token oracle matched but the implementation was reverted after this regression. Timestamp logged shortly after the run. |
 
 ## Measurement conventions
 
