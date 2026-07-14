@@ -451,6 +451,15 @@ struct Qwen35TextRuntime<B: Backend> {
     lm_head_tensor_disabled: AtomicBool,
 }
 
+/// A CUDA text runtime retained by a long-lived service.
+///
+/// Qwen tensor caches are populated lazily during the first request. Retaining this object avoids
+/// rebuilding those host and GPU tensor caches for subsequent requests to the same model.
+#[derive(Debug)]
+pub struct CachedBurnTextCudaRuntime {
+    runtime: Qwen35TextRuntime<LlmCudaBackend>,
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 struct Qwen35DecodeState {
@@ -3496,6 +3505,67 @@ pub fn generate_with_burn_text_runtime_to_sink(
     generate_with_burn_text_runtime_inner(artifacts, prompt_token_ids, options, Some(sink))
 }
 
+/// Load a CUDA text runtime that can be retained by a long-lived service.
+///
+/// # Errors
+///
+/// This function returns an error when the CUDA runtime is unavailable or the Burn text model
+/// cannot be loaded.
+pub fn load_cached_burn_text_cuda_runtime(
+    artifacts: &LlmModelArtifacts,
+) -> eyre::Result<CachedBurnTextCudaRuntime> {
+    verify_required_cuda_runtime()?;
+    Ok(CachedBurnTextCudaRuntime {
+        runtime: load_qwen35_runtime_with_log::<LlmCudaBackend>(
+            artifacts,
+            llm_inference_cuda_device(),
+            "cuda",
+        )?,
+    })
+}
+
+/// Generate with a retained CUDA runtime.
+///
+/// The default hybrid mode uses the retained runtime and therefore reuses its lazily populated
+/// weight caches. Explicit full and incremental diagnostic modes retain their existing uncached
+/// implementations.
+///
+/// # Errors
+///
+/// This function returns an error when generation cannot complete or the provided token sink
+/// rejects a token event.
+pub fn generate_with_cached_burn_text_runtime_to_sink(
+    cached_runtime: &CachedBurnTextCudaRuntime,
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+    options: &BurnTextGenerationOptions,
+    sink: &mut dyn GenerationEventSink,
+) -> eyre::Result<BurnTextGenerationReport> {
+    verify_required_cuda_runtime()?;
+    let mut token_sink = Some(sink);
+    match burn_text_generation_mode() {
+        BurnTextGenerationMode::Hybrid => {
+            generate_with_hybrid_burn_text_runtime_with_runtime::<LlmCudaBackend>(
+                &cached_runtime.runtime,
+                artifacts,
+                prompt_token_ids,
+                options,
+                "cuda",
+                &mut token_sink,
+            )
+        }
+        generation_mode => generate_with_selected_burn_text_runtime_on_device::<LlmCudaBackend>(
+            artifacts,
+            prompt_token_ids,
+            options,
+            generation_mode,
+            llm_inference_cuda_device(),
+            "cuda",
+            &mut token_sink,
+        ),
+    }
+}
+
 fn generate_with_burn_text_runtime_inner(
     artifacts: &LlmModelArtifacts,
     prompt_token_ids: &[u32],
@@ -4005,6 +4075,25 @@ fn generate_with_hybrid_burn_text_runtime_on_device<B: Backend>(
     backend_label: &str,
     token_sink: &mut Option<&mut dyn GenerationEventSink>,
 ) -> eyre::Result<BurnTextGenerationReport> {
+    let runtime = load_qwen35_runtime_with_log::<B>(artifacts, device, backend_label)?;
+    generate_with_hybrid_burn_text_runtime_with_runtime(
+        &runtime,
+        artifacts,
+        prompt_token_ids,
+        options,
+        backend_label,
+        token_sink,
+    )
+}
+
+fn generate_with_hybrid_burn_text_runtime_with_runtime<B: Backend>(
+    runtime: &Qwen35TextRuntime<B>,
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+    options: &BurnTextGenerationOptions,
+    backend_label: &str,
+    token_sink: &mut Option<&mut dyn GenerationEventSink>,
+) -> eyre::Result<BurnTextGenerationReport> {
     llm_tracy_zone!("llm_burn_generate_hybrid");
     #[cfg(feature = "extended_observability")]
     let _span = tracing::info_span!(
@@ -4030,18 +4119,10 @@ fn generate_with_hybrid_burn_text_runtime_on_device<B: Backend>(
             generated_text: String::new(),
         });
     }
-    if prompt_token_ids.is_empty() {
-        return generate_with_burn_text_runtime_on_device::<B>(
-            artifacts,
-            prompt_token_ids,
-            options,
-            device,
-            backend_label,
-            token_sink,
-        );
-    }
-
-    let runtime = load_qwen35_runtime_with_log::<B>(artifacts, device, backend_label)?;
+    ensure!(
+        !prompt_token_ids.is_empty(),
+        "Burn hybrid generation expected at least one prompt token"
+    );
     let tokenizer =
         tokenizers::Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|error| {
             eyre::eyre!(

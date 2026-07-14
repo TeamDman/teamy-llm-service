@@ -106,12 +106,27 @@ pub struct PrepareModelResult {
     pub registration_warning: Option<String>,
 }
 
+/// Controls whether a Qwen-style prompt reserves output tokens for an explicit reasoning pass.
+///
+/// Direct mode is the default because it gives ordinary short answers the lowest latency. Thinking
+/// mode remains available for tasks where a visible reasoning pass is worth the extra tokens.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Facet, Arbitrary)]
+#[facet(rename_all = "kebab-case")]
+pub enum ThinkingMode {
+    #[default]
+    Direct,
+    Thinking,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Facet, Arbitrary)]
 #[facet(rename_all = "kebab-case")]
 pub struct GenerateRequest {
     pub selector: ModelSelector,
     pub system_prompt: Option<String>,
     pub user_prompt: String,
+    #[facet(default)]
+    pub thinking_mode: ThinkingMode,
     pub max_new_tokens: usize,
     pub timeout_ms: Option<u64>,
 }

@@ -5656,6 +5656,7 @@ dependencies = [
  "reqwest",
  "safetensors 0.7.0",
  "teamy-cancellation",
+ "teamy_llm_core",
  "tempfile",
  "tokenizers",
  "tokio",

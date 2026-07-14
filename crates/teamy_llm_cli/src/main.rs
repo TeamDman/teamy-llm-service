@@ -3,7 +3,7 @@ use std::io::{self, Write};
 
 use color_eyre::eyre::{Result, bail, eyre};
 use teamy_cancellation::{CancellationToken, CtrlCHandler, StopAfterArgs};
-use teamy_llm_core::{GenerateEvent, GenerateRequest, ModelSelector, PrepareEvent};
+use teamy_llm_core::{GenerateEvent, GenerateRequest, ModelSelector, PrepareEvent, ThinkingMode};
 use teamy_llm_service::{TeamyLlmService, default_prepare_request};
 use tracing_subscriber::prelude::*;
 
@@ -125,10 +125,14 @@ fn run_prompt(
     let model = take_option_value(&mut args, "--model");
     let model_dir = take_option_value(&mut args, "--model-dir");
     let system_prompt = take_option_value(&mut args, "--system-prompt");
+    let thinking_mode = thinking_mode_from_args(&mut args)?;
     let max_new_tokens = take_option_value(&mut args, "--max-new-tokens")
         .map(|value| value.parse::<usize>())
         .transpose()?
-        .unwrap_or(256);
+        .unwrap_or(match thinking_mode {
+            ThinkingMode::Direct => 256,
+            ThinkingMode::Thinking => 1024,
+        });
     let timeout_ms = take_option_value(&mut args, "--timeout-ms")
         .map(|value| value.parse::<u64>())
         .transpose()?;
@@ -140,6 +144,7 @@ fn run_prompt(
         selector: ModelSelector { model, model_dir },
         system_prompt,
         user_prompt,
+        thinking_mode,
         max_new_tokens,
         timeout_ms,
     };
@@ -164,6 +169,19 @@ fn run_prompt(
         .map_err(|error| eyre!(error.to_string()))?;
     println!();
     Ok(())
+}
+
+fn thinking_mode_from_args(args: &mut Vec<String>) -> Result<ThinkingMode> {
+    let thinking = take_flag(args, "--thinking");
+    let direct = take_flag(args, "--no-thinking");
+    if thinking && direct {
+        bail!("`--thinking` and `--no-thinking` cannot be used together");
+    }
+    Ok(if thinking {
+        ThinkingMode::Thinking
+    } else {
+        ThinkingMode::Direct
+    })
 }
 
 fn stop_after_args_from(args: &mut Vec<String>) -> Result<StopAfterArgs> {
@@ -251,14 +269,15 @@ fn print_help() {
         "teamy-llm model prepare [model] [--overwrite] [--with-mmproj] [--with-burn-text] [--burn-text-only] [--burn-text-dtype <dtype>]"
     );
     println!(
-        "teamy-llm prompt [--stop-after <span-or-message>] [--stop-after-duration <duration>] [--model <name>|--model-dir <path>] [--system-prompt <text>] [--max-new-tokens <n>] [--timeout-ms <ms>] <prompt>"
+        "teamy-llm prompt [--stop-after <span-or-message>] [--stop-after-duration <duration>] [--model <name>|--model-dir <path>] [--system-prompt <text>] [--thinking|--no-thinking] [--max-new-tokens <n>] [--timeout-ms <ms>] <prompt>"
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::stop_after_args_from;
+    use super::{stop_after_args_from, thinking_mode_from_args};
     use std::time::Duration;
+    use teamy_llm_core::ThinkingMode;
 
     #[test]
     fn parses_stop_after_options_without_consuming_the_prompt_command() {
@@ -284,5 +303,21 @@ mod tests {
             Some(Duration::from_secs(2))
         );
         assert_eq!(args, ["prompt", "Why is the sky blue?"]);
+    }
+
+    #[test]
+    fn defaults_to_direct_mode_and_accepts_explicit_thinking_mode() {
+        let mut default_args = vec!["prompt".to_owned()];
+        assert_eq!(
+            thinking_mode_from_args(&mut default_args).expect("default thinking mode"),
+            ThinkingMode::Direct
+        );
+
+        let mut thinking_args = vec!["--thinking".to_owned(), "prompt".to_owned()];
+        assert_eq!(
+            thinking_mode_from_args(&mut thinking_args).expect("thinking mode"),
+            ThinkingMode::Thinking
+        );
+        assert_eq!(thinking_args, vec!["prompt"]);
     }
 }

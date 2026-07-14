@@ -27,6 +27,22 @@ teamy-llm prompt --stop-after "LLM model weights loaded" --max-new-tokens 200 "W
 between model-loading and generation operations, so it cannot preempt an already-running Burn/CUDA
 kernel.
 
+## Thinking modes
+
+The CLI defaults to direct answers: it uses the Qwopus tokenizer's native empty-thinking-block control
+instead of spending the output budget on a reasoning trace. Use `--thinking` when deliberate reasoning
+is useful; its default token budget is 1024 rather than the direct mode's 256. `--max-new-tokens` always
+overrides those defaults.
+
+```text
+teamy-llm prompt --no-thinking --max-new-tokens 128 "Why is the sky blue?"
+teamy-llm prompt --thinking --max-new-tokens 1024 "Compare two approaches and justify the choice."
+```
+
+A long-lived `TeamyLlmService` also retains the default hybrid CUDA runtime per model after its
+first request. This reuses lazily populated GPU weight caches for later requests; preparing a model
+invalidates its cached runtime so updated weights are never reused.
+
 ## CUDA runtime
 
 This is a GPU-only program: it does not fall back to CPU inference. The workspace pins Cudarc to the

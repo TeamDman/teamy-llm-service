@@ -3,6 +3,7 @@ use facet::Facet;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
+use teamy_llm_core::ThinkingMode;
 
 use crate::burn_backend::inspect_burn_runtime_support;
 use crate::burn_text::{
@@ -17,6 +18,7 @@ pub const DEFAULT_MAX_NEW_TOKENS: usize = 256;
 pub struct LlmPromptRequest {
     pub system_prompt: Option<String>,
     pub user_prompt: String,
+    pub thinking_mode: ThinkingMode,
     pub max_new_tokens: usize,
     pub generation_timeout: Option<Duration>,
 }
@@ -34,10 +36,15 @@ pub struct RenderedPrompt {
 
 /// Render a single-turn Qwen-style chat prompt using the same top-level shape as the published
 /// tokenizer template for system + user + assistant messages.
+///
+/// The Qwopus tokenizer starts thinking mode with an open `<think>` tag. Its native direct-answer
+/// control is an empty, closed thinking block before the answer, rather than a natural-language
+/// instruction asking the model not to think.
 #[must_use]
 pub fn render_qwen_single_turn_prompt(
     system_prompt: Option<&str>,
     user_prompt: &str,
+    thinking_mode: ThinkingMode,
 ) -> RenderedPrompt {
     let mut prompt = String::new();
     if let Some(system_prompt) = system_prompt.filter(|value| !value.trim().is_empty()) {
@@ -49,6 +56,10 @@ pub fn render_qwen_single_turn_prompt(
     prompt.push_str(user_prompt.trim());
     prompt.push_str("<|im_end|>\n");
     prompt.push_str("<|im_start|>assistant\n");
+    match thinking_mode {
+        ThinkingMode::Direct => prompt.push_str("<think>\n\n</think>\n\n"),
+        ThinkingMode::Thinking => prompt.push_str("<think>\n"),
+    }
     RenderedPrompt { prompt }
 }
 
@@ -108,8 +119,11 @@ fn run_prompt_inner(
     writer: Option<&mut dyn Write>,
 ) -> eyre::Result<LlmPromptResult> {
     let _summary = load_tokenizer_config_summary(&artifacts.tokenizer_config_path)?;
-    let rendered =
-        render_qwen_single_turn_prompt(request.system_prompt.as_deref(), &request.user_prompt);
+    let rendered = render_qwen_single_turn_prompt(
+        request.system_prompt.as_deref(),
+        &request.user_prompt,
+        request.thinking_mode,
+    );
     let _token_ids = tokenize_rendered_prompt(&artifacts.tokenizer_path, &rendered.prompt)?;
 
     let output_text = run_prompt_with_burn_backend(
@@ -164,14 +178,25 @@ mod tests {
         model::inspect_model_dir,
     };
     use std::{path::Path, time::Duration};
+    use teamy_llm_core::ThinkingMode;
     use tokenizers::{Tokenizer, models::bpe::BPE};
 
     #[test]
-    fn qwen_single_turn_prompt_matches_expected_shape() {
-        let rendered = render_qwen_single_turn_prompt(Some("You are concise."), "Hello");
+    fn qwen_single_turn_direct_prompt_matches_native_template() {
+        let rendered =
+            render_qwen_single_turn_prompt(Some("You are concise."), "Hello", ThinkingMode::Direct);
         assert_eq!(
             rendered.prompt,
-            "<|im_start|>system\nYou are concise.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
+            "<|im_start|>system\nYou are concise.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn qwen_single_turn_thinking_prompt_opens_a_reasoning_block() {
+        let rendered = render_qwen_single_turn_prompt(None, "Work it out.", ThinkingMode::Thinking);
+        assert_eq!(
+            rendered.prompt,
+            "<|im_start|>user\nWork it out.<|im_end|>\n<|im_start|>assistant\n<think>\n"
         );
     }
 
@@ -194,7 +219,7 @@ mod tests {
         };
         let artifacts = inspect_model_dir(Path::new(&model_dir))
             .expect("managed Jackrong model should inspect");
-        let rendered = render_qwen_single_turn_prompt(None, "Hello again");
+        let rendered = render_qwen_single_turn_prompt(None, "Hello again", ThinkingMode::Thinking);
         let token_ids = tokenize_rendered_prompt(&artifacts.tokenizer_path, &rendered.prompt)
             .expect("Jackrong prompt should tokenize");
         let report = generate_with_burn_text_runtime(

@@ -6,9 +6,10 @@ use std::time::Duration;
 use teamy_cancellation::CancellationToken;
 use teamy_llm_burn_qwen35::burn_backend::{BurnLlmSupportState, inspect_burn_runtime_support};
 use teamy_llm_burn_qwen35::burn_text::{
-    BurnTextGenerationOptions, GenerationEventSink as BackendGenerationEventSink,
-    generate_with_burn_text_runtime_to_sink, is_generation_cancelled_error,
-    is_generation_timeout_error, verify_required_cuda_runtime,
+    BurnTextGenerationOptions, CachedBurnTextCudaRuntime,
+    GenerationEventSink as BackendGenerationEventSink,
+    generate_with_cached_burn_text_runtime_to_sink, is_generation_cancelled_error,
+    is_generation_timeout_error, load_cached_burn_text_cuda_runtime, verify_required_cuda_runtime,
 };
 use teamy_llm_burn_qwen35::model::{
     DEFAULT_LLM_MODEL_NAME, LlmModelArtifacts, LlmModelPreparationState, inspect_model_dir,
@@ -41,6 +42,7 @@ pub struct TeamyLlmService {
     app_home: AppHome,
     cache_home: CacheHome,
     inspected_models: Arc<Mutex<HashMap<PathBuf, LlmModelArtifacts>>>,
+    cached_burn_runtimes: Arc<Mutex<HashMap<PathBuf, Arc<CachedBurnTextCudaRuntime>>>>,
     generation_queues: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
 }
 
@@ -50,6 +52,7 @@ impl TeamyLlmService {
             app_home,
             cache_home,
             inspected_models: Arc::new(Mutex::new(HashMap::new())),
+            cached_burn_runtimes: Arc::new(Mutex::new(HashMap::new())),
             generation_queues: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -138,6 +141,15 @@ impl TeamyLlmService {
                 ServiceError::new(ServiceErrorKind::Internal, "model cache mutex poisoned")
             })?
             .insert(prepared.artifacts.root.clone(), prepared.artifacts.clone());
+        self.cached_burn_runtimes
+            .lock()
+            .map_err(|_| {
+                ServiceError::new(
+                    ServiceErrorKind::Internal,
+                    "Burn runtime cache mutex poisoned",
+                )
+            })?
+            .remove(&prepared.artifacts.root);
         let model_dir = prepared.managed_dir.display().to_string();
         events(PrepareEvent::Completed {
             model_dir: model_dir.clone(),
@@ -197,13 +209,18 @@ impl TeamyLlmService {
         sink.send(GenerateEvent::Started {
             model_dir: artifacts.root.display().to_string(),
         })?;
-        let rendered =
-            render_qwen_single_turn_prompt(request.system_prompt.as_deref(), &request.user_prompt);
+        let rendered = render_qwen_single_turn_prompt(
+            request.system_prompt.as_deref(),
+            &request.user_prompt,
+            request.thinking_mode,
+        );
         sink.send(GenerateEvent::RenderedPrompt {
             prompt: rendered.prompt.clone(),
         })?;
         let token_ids = tokenize_rendered_prompt(&artifacts.tokenizer_path, &rendered.prompt)
             .map_err(map_invalid_request_error)?;
+        check_cancelled(cancellation_token.as_ref())?;
+        let cached_runtime = self.cached_burn_runtime(&artifacts)?;
         check_cancelled(cancellation_token.as_ref())?;
         let options = BurnTextGenerationOptions {
             max_new_tokens: request.max_new_tokens,
@@ -211,7 +228,8 @@ impl TeamyLlmService {
             cancellation_token,
         };
         let mut backend_sink = ServiceBackendSink { sink };
-        let report = generate_with_burn_text_runtime_to_sink(
+        let report = generate_with_cached_burn_text_runtime_to_sink(
+            &cached_runtime,
             &artifacts,
             &token_ids,
             &options,
@@ -236,6 +254,41 @@ impl TeamyLlmService {
             selector.model_dir.as_deref().map(Path::new),
         )
         .map_err(map_internal_error)
+    }
+
+    fn cached_burn_runtime(
+        &self,
+        artifacts: &LlmModelArtifacts,
+    ) -> Result<Arc<CachedBurnTextCudaRuntime>, ServiceError> {
+        let cached = self
+            .cached_burn_runtimes
+            .lock()
+            .map_err(|_| {
+                ServiceError::new(
+                    ServiceErrorKind::Internal,
+                    "Burn runtime cache mutex poisoned",
+                )
+            })?
+            .get(&artifacts.root)
+            .cloned();
+        if let Some(cached) = cached {
+            tracing::debug!(model_dir = %artifacts.root.display(), "reusing cached Burn CUDA runtime");
+            return Ok(cached);
+        }
+
+        tracing::info!(model_dir = %artifacts.root.display(), "loading Burn CUDA runtime into service cache");
+        let loaded =
+            Arc::new(load_cached_burn_text_cuda_runtime(artifacts).map_err(map_generation_error)?);
+        let mut runtimes = self.cached_burn_runtimes.lock().map_err(|_| {
+            ServiceError::new(
+                ServiceErrorKind::Internal,
+                "Burn runtime cache mutex poisoned",
+            )
+        })?;
+        Ok(runtimes
+            .entry(artifacts.root.clone())
+            .or_insert_with(|| loaded.clone())
+            .clone())
     }
 
     fn inspect_artifacts(&self, model_dir: &Path) -> Result<LlmModelArtifacts, ServiceError> {
