@@ -122,6 +122,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ariadne"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8454c8a44ce2cb9cc7e7fae67fc6128465b343b92c6631e94beca3c8d1524ea5"
+dependencies = [
+ "unicode-width",
+ "yansi",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -890,6 +900,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "camino"
+version = "1.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f2d30e4173c4026932d51d31d6b0613b1fd3014bf3f9f8943d4ba139c437ba0"
+
+[[package]]
 name = "candle-core"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1327,6 +1343,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "ctrlc"
+version = "3.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0b1fab2ae45819af2d0731d60f2afe17227ebb1a1538a236da84c93e9a60162"
+dependencies = [
+ "dispatch2",
+ "nix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2083,6 +2110,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
  "bitflags",
+ "block2",
+ "libc",
  "objc2",
 ]
 
@@ -2338,9 +2367,11 @@ version = "0.50.0-rc.5"
 source = "git+https://github.com/TeamDman/facet.git?rev=d0c3140ec6683f80249d50d74fa073911e0dfeb9#d0c3140ec6683f80249d50d74fa073911e0dfeb9"
 dependencies = [
  "autocfg",
+ "camino",
  "const-fnv1a-hash",
  "iddqd",
  "impls",
+ "indexmap",
 ]
 
 [[package]]
@@ -2350,6 +2381,14 @@ source = "git+https://github.com/TeamDman/facet.git?rev=d0c3140ec6683f80249d50d7
 dependencies = [
  "facet-core",
  "facet-reflect",
+]
+
+[[package]]
+name = "facet-error"
+version = "0.50.0-rc.5"
+source = "git+https://github.com/TeamDman/facet.git?rev=d0c3140ec6683f80249d50d74fa073911e0dfeb9#d0c3140ec6683f80249d50d74fa073911e0dfeb9"
+dependencies = [
+ "facet",
 ]
 
 [[package]]
@@ -2487,6 +2526,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
+]
+
+[[package]]
+name = "figue"
+version = "5.0.0-rc.5"
+source = "git+https://github.com/TeamDman/facet.git?rev=d0c3140ec6683f80249d50d74fa073911e0dfeb9#d0c3140ec6683f80249d50d74fa073911e0dfeb9"
+dependencies = [
+ "arbitrary",
+ "ariadne",
+ "camino",
+ "facet",
+ "facet-core",
+ "facet-error",
+ "facet-format",
+ "facet-json",
+ "facet-pretty",
+ "facet-reflect",
+ "figue-attrs",
+ "heck",
+ "indexmap",
+ "owo-colors",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "strip-ansi-escapes",
+ "strsim",
+ "supports-color 3.0.2",
+ "tracing",
+ "unicode-width",
+]
+
+[[package]]
+name = "figue-attrs"
+version = "5.0.0-rc.5"
+source = "git+https://github.com/TeamDman/facet.git?rev=d0c3140ec6683f80249d50d74fa073911e0dfeb9#d0c3140ec6683f80249d50d74fa073911e0dfeb9"
+dependencies = [
+ "facet",
 ]
 
 [[package]]
@@ -4918,12 +4993,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots 1.0.8",
 ]
@@ -5412,6 +5489,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "strip-ansi-escapes"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a8f8038e7e7969abb3f1b7c2a811225e9296da208539e0f79c5251d6cac0025"
+dependencies = [
+ "vte",
+]
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5541,6 +5627,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "teamy-cancellation"
+version = "0.3.1"
+source = "git+https://github.com/TeamDman/teamy-cancellation.git?tag=v0.3.1#cc782906597b4294a63ab0f056c2928d48f724a4"
+dependencies = [
+ "ctrlc",
+ "eyre",
+ "facet",
+ "figue",
+ "humantime",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "teamy_llm_burn_qwen35"
 version = "0.1.0"
 dependencies = [
@@ -5555,8 +5655,10 @@ dependencies = [
  "memmap2",
  "reqwest",
  "safetensors 0.7.0",
+ "teamy-cancellation",
  "tempfile",
  "tokenizers",
+ "tokio",
  "tracing",
  "tracy-client",
 ]
@@ -5568,6 +5670,7 @@ dependencies = [
  "color-eyre",
  "eyre",
  "humantime",
+ "teamy-cancellation",
  "teamy_llm_core",
  "teamy_llm_service",
  "tokio",
@@ -5589,6 +5692,7 @@ version = "0.1.0"
 dependencies = [
  "eyre",
  "humantime",
+ "teamy-cancellation",
  "teamy_llm_burn_qwen35",
  "teamy_llm_core",
  "tempfile",
@@ -6548,6 +6652,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vte"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "231fdcd7ef3037e8330d8e17e61011a2c244126acc0a982f4040ac3f9f0bc077"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6634,6 +6747,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
@@ -7240,6 +7366,12 @@ name = "y4m"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a5a4b21e1a62b67a2970e6831bc091d7b87e119e7f9791aef9702e3bef04448"
+
+[[package]]
+name = "yansi"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "yoke"

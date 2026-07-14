@@ -17,6 +17,7 @@ eyre.workspace = true
 humantime.workspace = true
 teamy_llm_core.workspace = true
 teamy_llm_service = { workspace = true, features = ["vox"] }
+teamy-cancellation = { workspace = true, features = ["ctrlc", "tracing", "tracing-subscriber", "figue"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tokio.workspace = true

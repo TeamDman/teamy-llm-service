@@ -2,17 +2,28 @@ use std::env;
 use std::io::{self, Write};
 
 use color_eyre::eyre::{Result, bail, eyre};
+use teamy_cancellation::{CancellationToken, CtrlCHandler, StopAfterArgs};
 use teamy_llm_core::{GenerateEvent, GenerateRequest, ModelSelector, PrepareEvent};
 use teamy_llm_service::{TeamyLlmService, default_prepare_request};
+use tracing_subscriber::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
     let mut args = env::args().skip(1).collect::<Vec<_>>();
+    let stop_after = stop_after_args_from(&mut args)?;
+    let cancellation_token = CtrlCHandler::default().install()?;
+    let _stop_after_duration_thread =
+        stop_after.start_stop_after_duration_thread(cancellation_token.clone())?;
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_filter(tracing_subscriber::EnvFilter::from_default_env()),
+            )
+            .with(stop_after.stop_after_span_layer(cancellation_token.clone())),
+    )?;
+
     if args.is_empty() {
         print_help();
         return Ok(());
@@ -33,15 +44,16 @@ async fn main() -> Result<()> {
                 take_option_value(&mut args, "--address").unwrap_or_else(default_local_address);
             serve(service, &address).await?;
         }
-        "model" => run_model(service, args)?,
-        "prompt" => run_prompt(service, args)?,
+        "model" => run_model(service, args).await?,
+        "prompt" => run_prompt(service, args, cancellation_token.clone())?,
         "help" | "--help" | "-h" => print_help(),
         other => bail!("unknown command `{other}`"),
     }
+    cancellation_token.bail_if_cancelled()?;
     Ok(())
 }
 
-fn run_model(service: TeamyLlmService, mut args: Vec<String>) -> Result<()> {
+async fn run_model(service: TeamyLlmService, mut args: Vec<String>) -> Result<()> {
     if args.is_empty() {
         bail!("model command requires `list`, `show`, or `prepare`");
     }
@@ -93,6 +105,7 @@ fn run_model(service: TeamyLlmService, mut args: Vec<String>) -> Result<()> {
                     print_prepare_event(event);
                     Ok(())
                 })
+                .await
                 .map_err(|error| eyre!(error.to_string()))?;
             println!("prepared: {}", result.model_dir);
             if let Some(warning) = result.registration_warning {
@@ -104,7 +117,11 @@ fn run_model(service: TeamyLlmService, mut args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-fn run_prompt(service: TeamyLlmService, mut args: Vec<String>) -> Result<()> {
+fn run_prompt(
+    service: TeamyLlmService,
+    mut args: Vec<String>,
+    cancellation_token: CancellationToken,
+) -> Result<()> {
     let model = take_option_value(&mut args, "--model");
     let model_dir = take_option_value(&mut args, "--model-dir");
     let system_prompt = take_option_value(&mut args, "--system-prompt");
@@ -128,7 +145,7 @@ fn run_prompt(service: TeamyLlmService, mut args: Vec<String>) -> Result<()> {
     };
     let mut stdout = io::stdout();
     let _result = service
-        .generate(request, &mut |event| {
+        .generate_with_cancellation(request, Some(cancellation_token), &mut |event| {
             match event {
                 GenerateEvent::Token { text, .. } => {
                     print!("{text}");
@@ -147,6 +164,29 @@ fn run_prompt(service: TeamyLlmService, mut args: Vec<String>) -> Result<()> {
         .map_err(|error| eyre!(error.to_string()))?;
     println!();
     Ok(())
+}
+
+fn stop_after_args_from(args: &mut Vec<String>) -> Result<StopAfterArgs> {
+    Ok(StopAfterArgs {
+        stop_after_span: take_required_option_value(args, "--stop-after")?,
+        stop_after_duration: take_required_option_value(args, "--stop-after-duration")?,
+    })
+}
+
+fn take_required_option_value(args: &mut Vec<String>, flag: &str) -> Result<Option<String>> {
+    let Some(index) = args.iter().position(|arg| arg == flag) else {
+        return Ok(None);
+    };
+    args.remove(index);
+    args.get(index)
+        .filter(|value| !value.starts_with('-'))
+        .cloned()
+        .map(|value| {
+            args.remove(index);
+            value
+        })
+        .map(Some)
+        .ok_or_else(|| eyre!("{flag} requires a value"))
 }
 
 fn selector_from_args(args: &mut Vec<String>) -> ModelSelector {
@@ -203,6 +243,7 @@ fn default_local_address() -> String {
 }
 
 fn print_help() {
+    println!("global options: [--stop-after <span-or-message>] [--stop-after-duration <duration>]");
     println!("teamy-llm health");
     println!("teamy-llm serve [--address local://teamy-llm-service]");
     println!("teamy-llm model list");
@@ -211,6 +252,38 @@ fn print_help() {
         "teamy-llm model prepare [model] [--overwrite] [--with-mmproj] [--with-burn-text] [--burn-text-only] [--burn-text-dtype <dtype>]"
     );
     println!(
-        "teamy-llm prompt [--model <name>|--model-dir <path>] [--system-prompt <text>] [--max-new-tokens <n>] [--timeout-ms <ms>] <prompt>"
+        "teamy-llm prompt [--stop-after <span-or-message>] [--stop-after-duration <duration>] [--model <name>|--model-dir <path>] [--system-prompt <text>] [--max-new-tokens <n>] [--timeout-ms <ms>] <prompt>"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stop_after_args_from;
+    use std::time::Duration;
+
+    #[test]
+    fn parses_stop_after_options_without_consuming_the_prompt_command() {
+        let mut args = vec![
+            "prompt".to_owned(),
+            "--stop-after".to_owned(),
+            "LLM model weights loaded".to_owned(),
+            "--stop-after-duration".to_owned(),
+            "2s".to_owned(),
+            "Why is the sky blue?".to_owned(),
+        ];
+
+        let stop_after = stop_after_args_from(&mut args).expect("stop-after args should parse");
+
+        assert_eq!(
+            stop_after.stop_after_span.as_deref(),
+            Some("LLM model weights loaded")
+        );
+        assert_eq!(
+            stop_after
+                .stop_after_duration()
+                .expect("duration should parse"),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(args, ["prompt", "Why is the sky blue?"]);
+    }
 }

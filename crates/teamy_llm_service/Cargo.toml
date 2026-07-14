@@ -15,6 +15,7 @@ tracing.workspace = true
 vox = { workspace = true, optional = true }
 teamy_llm_core.workspace = true
 teamy_llm_burn_qwen35.workspace = true
+teamy-cancellation.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -12,3 +12,23 @@ V1 exposes Facet-serializable request/response/event models, extracts the Teamy-
 - `teamy_llm_cli`: local commands for health, model inspection/preparation, and prompt generation.
 
 The workspace pins `facet`, `figue`, and `vox` to the same TeamDman/facet git revision used by Cloud-Terrastodon.
+
+## CLI cancellation
+
+The local CLI accepts the same cancellation options as `teamy-rust-cli`:
+
+```text
+teamy-llm prompt --stop-after-duration 2m --max-new-tokens 200 "Why is the sky blue?"
+teamy-llm prompt --stop-after "LLM model weights loaded" --max-new-tokens 200 "Why is the sky blue?"
+```
+
+`--stop-after-duration` accepts `humantime` durations such as `500ms`, `2s`, and `1m`.
+`--stop-after` matches a tracing span or event message. Cancellation is cooperative: it is checked
+between model-loading and generation operations, so it cannot preempt an already-running Burn/CUDA
+kernel.
+
+## CUDA runtime
+
+CUDA inference needs the CUDA runtime compiler (`nvrtc`) to be discoverable through `PATH` at runtime.
+Having an NVIDIA driver (and therefore `nvidia-smi`) is not sufficient by itself; install a compatible
+CUDA Toolkit or otherwise provide its NVRTC runtime directory on `PATH`.

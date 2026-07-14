@@ -118,6 +118,7 @@ fn run_prompt_inner(
         &BurnTextGenerationOptions {
             max_new_tokens: request.max_new_tokens,
             generation_timeout: request.generation_timeout,
+            cancellation_token: None,
         },
         writer,
     )
@@ -202,6 +203,7 @@ mod tests {
             &BurnTextGenerationOptions {
                 max_new_tokens: 1,
                 generation_timeout: Some(Duration::from_secs(30)),
+                cancellation_token: None,
             },
         )
         .expect("Jackrong Burn text runtime should generate one token");

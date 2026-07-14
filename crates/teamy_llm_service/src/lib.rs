@@ -3,10 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use teamy_cancellation::CancellationToken;
 use teamy_llm_burn_qwen35::burn_backend::{BurnLlmSupportState, inspect_burn_runtime_support};
 use teamy_llm_burn_qwen35::burn_text::{
     BurnTextGenerationOptions, GenerationEventSink as BackendGenerationEventSink,
-    generate_with_burn_text_runtime_to_sink, is_generation_timeout_error,
+    generate_with_burn_text_runtime_to_sink, is_generation_cancelled_error,
+    is_generation_timeout_error,
 };
 use teamy_llm_burn_qwen35::model::{
     DEFAULT_LLM_MODEL_NAME, LlmModelArtifacts, LlmModelPreparationState, inspect_model_dir,
@@ -91,7 +93,7 @@ impl TeamyLlmService {
         })
     }
 
-    pub fn prepare_model(
+    pub async fn prepare_model(
         &self,
         request: PrepareModelRequest,
         mut events: impl FnMut(PrepareEvent) -> Result<(), ServiceError>,
@@ -107,17 +109,26 @@ impl TeamyLlmService {
             request.include_mmproj,
             request.download_main_model_file,
         )
+        .await
         .map_err(map_internal_error)?;
         events(PrepareEvent::ModelPrepared {
             model_dir: prepared.managed_dir.display().to_string(),
         })?;
         if request.export_burn_text {
             events(PrepareEvent::BurnTextExportStarted)?;
-            let message = prepare_burn_text_runtime_bundle(
-                &prepared.artifacts,
-                request.overwrite,
-                request.burn_text_dtype.as_deref(),
-            )
+            let artifacts = prepared.artifacts.clone();
+            let overwrite = request.overwrite;
+            let burn_text_dtype = request.burn_text_dtype.clone();
+            let message = tokio::task::spawn_blocking(move || {
+                prepare_burn_text_runtime_bundle(&artifacts, overwrite, burn_text_dtype.as_deref())
+            })
+            .await
+            .map_err(|error| {
+                ServiceError::new(
+                    ServiceErrorKind::Internal,
+                    format!("Burn text export task failed: {error}"),
+                )
+            })?
             .map_err(map_internal_error)?;
             events(PrepareEvent::BurnTextExportCompleted { message })?;
         }
@@ -147,7 +158,18 @@ impl TeamyLlmService {
         request: GenerateRequest,
         sink: &mut impl GenerateEventSink,
     ) -> Result<GenerateResult, ServiceError> {
+        self.generate_with_cancellation(request, None, sink)
+    }
+
+    pub fn generate_with_cancellation(
+        &self,
+        request: GenerateRequest,
+        cancellation_token: Option<CancellationToken>,
+        sink: &mut impl GenerateEventSink,
+    ) -> Result<GenerateResult, ServiceError> {
+        check_cancelled(cancellation_token.as_ref())?;
         let model_dir = self.resolve_model_dir(&request.selector)?;
+        check_cancelled(cancellation_token.as_ref())?;
         let queue = self.queue_for_model(&model_dir)?;
         let _queue_guard = queue.lock().map_err(|_| {
             ServiceError::new(
@@ -156,7 +178,9 @@ impl TeamyLlmService {
             )
         })?;
 
+        check_cancelled(cancellation_token.as_ref())?;
         let artifacts = self.inspect_artifacts(&model_dir)?;
+        check_cancelled(cancellation_token.as_ref())?;
         let burn_support = inspect_burn_runtime_support(&artifacts).map_err(map_internal_error)?;
         if burn_support.state != BurnLlmSupportState::Ready {
             return Err(ServiceError::new(
@@ -178,9 +202,11 @@ impl TeamyLlmService {
         })?;
         let token_ids = tokenize_rendered_prompt(&artifacts.tokenizer_path, &rendered.prompt)
             .map_err(map_invalid_request_error)?;
+        check_cancelled(cancellation_token.as_ref())?;
         let options = BurnTextGenerationOptions {
             max_new_tokens: request.max_new_tokens,
             generation_timeout: request.timeout_ms.map(Duration::from_millis),
+            cancellation_token,
         };
         let mut backend_sink = ServiceBackendSink { sink };
         let report = generate_with_burn_text_runtime_to_sink(
@@ -246,6 +272,15 @@ impl TeamyLlmService {
     }
 }
 
+fn check_cancelled(cancellation_token: Option<&CancellationToken>) -> Result<(), ServiceError> {
+    let Some(cancellation_token) = cancellation_token else {
+        return Ok(());
+    };
+    cancellation_token
+        .bail_if_cancelled()
+        .map_err(|error| ServiceError::new(ServiceErrorKind::Cancelled, error.to_string()))
+}
+
 struct ServiceBackendSink<'a, S: GenerateEventSink> {
     sink: &'a mut S,
 }
@@ -297,7 +332,10 @@ fn map_internal_error(error: eyre::Report) -> ServiceError {
 fn map_generation_error(error: eyre::Report) -> ServiceError {
     if is_generation_timeout_error(&error) {
         ServiceError::new(ServiceErrorKind::Timeout, error.to_string())
-    } else if error.to_string().contains("Cancelled") || error.to_string().contains("cancelled") {
+    } else if is_generation_cancelled_error(&error)
+        || error.to_string().contains("Cancelled")
+        || error.to_string().contains("cancelled")
+    {
         ServiceError::new(ServiceErrorKind::Cancelled, error.to_string())
     } else {
         ServiceError::new(ServiceErrorKind::BackendUnavailable, error.to_string())
@@ -363,6 +401,7 @@ pub mod vox_api {
                     ServiceError::new(ServiceErrorKind::Cancelled, error.to_string())
                 })
             })
+            .await
         }
 
         async fn generate(

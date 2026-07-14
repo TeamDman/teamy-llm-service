@@ -27,8 +27,9 @@ eyre = "0.6.12"
 half = "2.7.1"
 humantime = "2.2.0"
 memmap2 = "0.9.9"
-reqwest = { version = "0.12.23", default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.12.23", default-features = false, features = ["blocking", "rustls-tls", "stream"] }
 safetensors = "0.7.0"
+teamy-cancellation = { git = "https://github.com/TeamDman/teamy-cancellation.git", tag = "v0.3.1", default-features = false }
 tempfile = "3.20.0"
 tokio = { version = "1.49.0", features = ["full"] }
 tokenizers = { version = "0.22.0", default-features = false, features = ["onig"] }

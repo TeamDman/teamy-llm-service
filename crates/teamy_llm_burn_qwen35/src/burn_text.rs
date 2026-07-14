@@ -28,6 +28,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use teamy_cancellation::CancellationToken;
 
 use crate::{
     model::{LlmModelArtifacts, load_tokenizer_config_summary},
@@ -162,10 +163,12 @@ pub struct BurnTextGenerationReport {
     pub generated_text: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct BurnTextGenerationOptions {
     pub max_new_tokens: usize,
     pub generation_timeout: Option<Duration>,
+    /// Cooperatively stops loading and generation when cancellation is requested.
+    pub cancellation_token: Option<CancellationToken>,
 }
 
 pub trait GenerationEventSink {
@@ -261,6 +264,7 @@ enum HiddenActivationKind {
 struct GenerationDeadline {
     started_at: Instant,
     timeout: Option<Duration>,
+    cancellation_token: Option<CancellationToken>,
 }
 
 #[derive(Debug)]
@@ -268,6 +272,11 @@ struct GenerationTimeoutError {
     elapsed: Duration,
     generated_token_count: usize,
     max_new_tokens: usize,
+}
+
+#[derive(Debug)]
+struct GenerationCancelledError {
+    reason: String,
 }
 
 #[derive(Debug)]
@@ -2264,12 +2273,21 @@ impl fmt::Display for GenerationTimeoutError {
 
 impl std::error::Error for GenerationTimeoutError {}
 
+impl fmt::Display for GenerationCancelledError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Burn text generation cancelled: {}", self.reason)
+    }
+}
+
+impl std::error::Error for GenerationCancelledError {}
+
 #[derive(Clone, Debug)]
 struct GenerationDeadlineContext {
     started_at: Instant,
     timeout: Duration,
     generated_token_count: usize,
     max_new_tokens: usize,
+    cancellation_token: Option<CancellationToken>,
 }
 
 thread_local! {
@@ -2289,10 +2307,11 @@ impl Drop for GenerationDeadlineScope {
 }
 
 impl GenerationDeadline {
-    fn new(timeout: Option<Duration>) -> Self {
+    fn new(timeout: Option<Duration>, cancellation_token: Option<CancellationToken>) -> Self {
         Self {
             started_at: Instant::now(),
             timeout,
+            cancellation_token,
         }
     }
 
@@ -2302,6 +2321,7 @@ impl GenerationDeadline {
             timeout,
             generated_token_count: 0,
             max_new_tokens,
+            cancellation_token: self.cancellation_token.clone(),
         });
         let previous = GENERATION_DEADLINE_CONTEXT.with(|context| {
             let mut context = context.borrow_mut();
@@ -2322,11 +2342,13 @@ impl GenerationDeadline {
                 timeout,
                 generated_token_count,
                 max_new_tokens,
+                cancellation_token: self.cancellation_token.clone(),
             });
         });
     }
 
     fn check(&self, generated_token_count: usize, max_new_tokens: usize) -> eyre::Result<()> {
+        check_generation_cancellation(self.cancellation_token.as_ref())?;
         let Some(timeout) = self.timeout else {
             return Ok(());
         };
@@ -2346,6 +2368,7 @@ impl GenerationDeadline {
         let Some(context) = context else {
             return Ok(());
         };
+        check_generation_cancellation(context.cancellation_token.as_ref())?;
         let elapsed = context.started_at.elapsed();
         if elapsed <= context.timeout {
             return Ok(());
@@ -2358,10 +2381,31 @@ impl GenerationDeadline {
     }
 }
 
+fn check_generation_cancellation(
+    cancellation_token: Option<&CancellationToken>,
+) -> eyre::Result<()> {
+    let Some(cancellation_token) = cancellation_token else {
+        return Ok(());
+    };
+    if cancellation_token.is_cancelled() {
+        let reason = cancellation_token
+            .cancellation_reason()
+            .unwrap_or_else(|| "Operation cancelled".to_owned());
+        return Err(eyre::Report::new(GenerationCancelledError { reason }));
+    }
+    Ok(())
+}
+
 pub fn is_generation_timeout_error(error: &eyre::Report) -> bool {
     error
         .chain()
         .any(|source| source.downcast_ref::<GenerationTimeoutError>().is_some())
+}
+
+pub fn is_generation_cancelled_error(error: &eyre::Report) -> bool {
+    error
+        .chain()
+        .any(|source| source.downcast_ref::<GenerationCancelledError>().is_some())
 }
 
 fn validate_manifest_contract(
@@ -3497,7 +3541,7 @@ fn try_generate_with_cuda_backend(
     match attempt {
         Ok(Ok(report)) => Ok(Some(report)),
         Ok(Err(error)) => {
-            if is_generation_timeout_error(&error) {
+            if is_generation_timeout_error(&error) || is_generation_cancelled_error(&error) {
                 return Err(error);
             }
             trace_burn_text_runtime(&format!(
@@ -3531,7 +3575,7 @@ fn try_compare_with_incremental_cuda_backend(
     match attempt {
         Ok(Ok(report)) => Ok(Some(report)),
         Ok(Err(error)) => {
-            if is_generation_timeout_error(&error) {
+            if is_generation_timeout_error(&error) || is_generation_cancelled_error(&error) {
                 return Err(error);
             }
             trace_burn_text_runtime(&format!(
@@ -3818,7 +3862,10 @@ fn generate_with_burn_text_runtime_on_device<B: Backend>(
         "using {backend_label} backend for Burn text runtime"
     ));
     let generation_started_at = Instant::now();
-    let deadline = GenerationDeadline::new(options.generation_timeout);
+    let deadline = GenerationDeadline::new(
+        options.generation_timeout,
+        options.cancellation_token.clone(),
+    );
     let _deadline_scope = deadline.enter_scope(options.max_new_tokens);
     let runtime = load_qwen35_runtime_with_log::<B>(artifacts, device, backend_label)?;
     let tokenizer =
@@ -3910,7 +3957,10 @@ fn generate_with_incremental_burn_text_runtime_on_device<B: Backend>(
         "using {backend_label} backend for Burn text incremental runtime"
     ));
     let generation_started_at = Instant::now();
-    let deadline = GenerationDeadline::new(options.generation_timeout);
+    let deadline = GenerationDeadline::new(
+        options.generation_timeout,
+        options.cancellation_token.clone(),
+    );
     let _deadline_scope = deadline.enter_scope(options.max_new_tokens);
     ensure!(
         !prompt_token_ids.is_empty(),
@@ -4008,7 +4058,10 @@ fn generate_with_hybrid_burn_text_runtime_on_device<B: Backend>(
         "using {backend_label} backend for Burn text hybrid runtime"
     ));
     let generation_started_at = Instant::now();
-    let deadline = GenerationDeadline::new(options.generation_timeout);
+    let deadline = GenerationDeadline::new(
+        options.generation_timeout,
+        options.cancellation_token.clone(),
+    );
     let _deadline_scope = deadline.enter_scope(options.max_new_tokens);
     if options.max_new_tokens == 0 {
         log_generation_complete(backend_label, 0, generation_started_at);
@@ -5570,10 +5623,11 @@ fn softplus_scalar(value: f32) -> f32 {
 mod tests {
     use super::{
         BURN_TEXT_DIR_NAME, BURN_TEXT_MANIFEST_FILE_NAME, BurnTextManifest, BurnTextTensorSpec,
-        LlmCpuBackend, SOURCE_SAFETENSORS_INDEX_FILE_NAME, apply_rotary_slice, bytes_per_element,
-        causal_mask, decode_bytes_into_f32, dot_product, export_burn_text_weights, f16_bits_to_f32,
-        first_mismatch_index, inspect_burn_text_runtime_status, rotary_embeddings, sigmoid_scalar,
-        softmax_scalars, softmax_scalars_in_place,
+        CancellationToken, LlmCpuBackend, SOURCE_SAFETENSORS_INDEX_FILE_NAME, apply_rotary_slice,
+        bytes_per_element, causal_mask, check_generation_cancellation, decode_bytes_into_f32,
+        dot_product, export_burn_text_weights, f16_bits_to_f32, first_mismatch_index,
+        inspect_burn_text_runtime_status, is_generation_cancelled_error, rotary_embeddings,
+        sigmoid_scalar, softmax_scalars, softmax_scalars_in_place,
     };
     use crate::model::{
         DEFAULT_LLM_MODEL_NAME, HF_CONFIG_FILE_NAME, MODEL_FILE_NAME, TOKENIZER_CONFIG_FILE_NAME,
@@ -5593,6 +5647,17 @@ mod tests {
         std::fs::write(burn_dir.join(BURN_TEXT_MANIFEST_FILE_NAME), b"{}").expect("manifest");
         let status = inspect_burn_text_runtime_status(temp.path());
         assert!(status.exists);
+    }
+
+    #[test]
+    fn cancellation_errors_are_distinguished_from_backend_failures() {
+        let cancellation_token = CancellationToken::new();
+        cancellation_token.request_cancel("test cancellation");
+
+        let error = check_generation_cancellation(Some(&cancellation_token))
+            .expect_err("cancelled token should stop generation");
+
+        assert!(is_generation_cancelled_error(&error));
     }
 
     #[test]

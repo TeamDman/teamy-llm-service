@@ -2,6 +2,7 @@ use eyre::{Context, bail};
 use facet::Facet;
 use facet_json::RawJson;
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncWriteExt;
 
 use crate::paths::{AppHome, CacheHome};
 
@@ -506,7 +507,7 @@ fn parse_tokenizer_config_token_value(value: RawJson<'static>) -> eyre::Result<S
 /// # Errors
 ///
 /// This function will return an error if the model cannot be downloaded, validated, or registered.
-pub fn prepare_known_llm_model(
+pub async fn prepare_known_llm_model(
     app_home: &AppHome,
     cache_home: &CacheHome,
     model_name: &str,
@@ -555,24 +556,27 @@ pub fn prepare_known_llm_model(
     })?;
 
     if download_main_model_file {
-        download_to_file(&model_file_url(known), &staging_dir.join(MODEL_FILE_NAME))?;
+        download_to_file(&model_file_url(known), &staging_dir.join(MODEL_FILE_NAME)).await?;
     } else {
         write_burn_text_only_model_placeholder(&staging_dir.join(MODEL_FILE_NAME))?;
     }
     download_to_file(
         &tokenizer_file_url(known),
         &staging_dir.join(TOKENIZER_FILE_NAME),
-    )?;
+    )
+    .await?;
     download_to_file(
         &tokenizer_config_file_url(known),
         &staging_dir.join(TOKENIZER_CONFIG_FILE_NAME),
-    )?;
+    )
+    .await?;
     download_to_file(
         &hf_config_file_url(known),
         &staging_dir.join(HF_CONFIG_FILE_NAME),
-    )?;
+    )
+    .await?;
     if include_mmproj {
-        download_to_file(&mmproj_file_url(known), &staging_dir.join(MMPROJ_FILE_NAME))?;
+        download_to_file(&mmproj_file_url(known), &staging_dir.join(MMPROJ_FILE_NAME)).await?;
     }
     write_model_metadata(&staging_dir, known, include_mmproj)?;
 
@@ -867,42 +871,57 @@ fn remove_existing_path(path: &Path) -> eyre::Result<()> {
     .wrap_err_with(|| format!("Failed to remove existing path {}", path.display()))
 }
 
-fn download_to_file(url: &str, destination: &Path) -> eyre::Result<()> {
+async fn download_to_file(url: &str, destination: &Path) -> eyre::Result<()> {
     if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent).wrap_err_with(|| {
+        tokio::fs::create_dir_all(parent).await.wrap_err_with(|| {
             format!("Failed to create download directory {}", parent.display())
         })?;
     }
     if let Some((repo_id, file_name)) = parse_hugging_face_resolve_url(url)
         && let Some(cached_source) = resolve_local_hugging_face_repo_file(repo_id, file_name)?
     {
-        std::fs::copy(&cached_source, destination).wrap_err_with(|| {
-            format!(
-                "Failed to copy cached Hugging Face file {} into {}",
-                cached_source.display(),
-                destination.display()
-            )
-        })?;
+        tokio::fs::copy(&cached_source, destination)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "Failed to copy cached Hugging Face file {} into {}",
+                    cached_source.display(),
+                    destination.display()
+                )
+            })?;
         return Ok(());
     }
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .build()
         .wrap_err("Failed to build HTTP client for model download")?;
     let mut response = client
         .get(url)
         .send()
+        .await
         .wrap_err_with(|| format!("Failed to start download from {url}"))?;
     if !response.status().is_success() {
         bail!("Download failed from {url} with HTTP {}", response.status());
     }
-    let mut output = std::fs::File::create(destination)
+    let mut output = tokio::fs::File::create(destination)
+        .await
         .wrap_err_with(|| format!("Failed to create {}", destination.display()))?;
-    std::io::copy(&mut response, &mut output).wrap_err_with(|| {
+    while let Some(chunk) = response.chunk().await.wrap_err_with(|| {
         format!(
             "Failed to stream download body from {url} into {}",
             destination.display()
         )
-    })?;
+    })? {
+        output.write_all(&chunk).await.wrap_err_with(|| {
+            format!(
+                "Failed to write download body from {url} into {}",
+                destination.display()
+            )
+        })?;
+    }
+    output
+        .flush()
+        .await
+        .wrap_err_with(|| format!("Failed to flush downloaded file {}", destination.display()))?;
     Ok(())
 }
 

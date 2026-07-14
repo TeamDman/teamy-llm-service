@@ -19,6 +19,8 @@ humantime.workspace = true
 memmap2.workspace = true
 reqwest.workspace = true
 safetensors.workspace = true
+teamy-cancellation.workspace = true
+tokio.workspace = true
 tokenizers.workspace = true
 tracing.workspace = true
 tracy-client = { workspace = true, optional = true }
