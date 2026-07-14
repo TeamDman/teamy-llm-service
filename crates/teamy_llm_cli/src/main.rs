@@ -181,9 +181,8 @@ fn take_required_option_value(args: &mut Vec<String>, flag: &str) -> Result<Opti
     args.get(index)
         .filter(|value| !value.starts_with('-'))
         .cloned()
-        .map(|value| {
+        .inspect(|_| {
             args.remove(index);
-            value
         })
         .map(Some)
         .ok_or_else(|| eyre!("{flag} requires a value"))

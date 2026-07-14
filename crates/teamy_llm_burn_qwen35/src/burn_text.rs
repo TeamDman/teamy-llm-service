@@ -1,5 +1,7 @@
+#[cfg(test)]
+use burn::backend::NdArray;
 use burn::{
-    backend::{Cuda, NdArray, cuda::CudaDevice, ndarray::NdArrayDevice},
+    backend::{Cuda, cuda::CudaDevice},
     tensor::{
         Tensor, TensorData,
         activation::{self, softmax},
@@ -41,8 +43,102 @@ pub const DEFAULT_BURN_TEXT_EXPORT_DTYPE: &str = "float16";
 const DEFAULT_LOGIT_CHUNK_ROWS: usize = 512;
 const SOURCE_SAFETENSORS_INDEX_FILE_NAME: &str = "model.safetensors.index.json";
 
-pub type LlmCpuBackend = NdArray<f32>;
 pub type LlmCudaBackend = Cuda<f16, i32>;
+#[cfg(test)]
+pub type LlmCpuBackend = NdArray<f32>;
+
+pub const REQUIRED_CUDA_MAJOR_VERSION: u32 = 13;
+pub const REQUIRED_CUDA_MINOR_VERSION: u32 = 3;
+pub const REQUIRED_CUDA_MIN_DRIVER_MAJOR_VERSION: u32 = 580;
+pub const REQUIRED_CUDA_NVRTC_DLL_NAME: &str = "nvrtc64_133_0.dll";
+
+/// Verify that the CUDA 13.3 runtime required by the GPU-only backend is available.
+///
+/// # Errors
+///
+/// Returns an error when `CUDA_PATH` is absent, NVRTC 13.3 is missing from the process DLL search
+/// path, or the NVIDIA driver is older than the CUDA 13.x minimum compatibility range.
+pub fn verify_required_cuda_runtime() -> eyre::Result<PathBuf> {
+    let cuda_path = std::env::var_os("CUDA_PATH").ok_or_else(|| {
+        eyre::eyre!(
+            "CUDA {REQUIRED_CUDA_MAJOR_VERSION}.{REQUIRED_CUDA_MINOR_VERSION} is required; CUDA_PATH is not set"
+        )
+    })?;
+    let nvrtc_path = verify_required_cuda_runtime_in(Path::new(&cuda_path))?;
+    verify_cuda_runtime_is_on_path(&nvrtc_path)?;
+    verify_required_cuda_driver()?;
+    Ok(nvrtc_path)
+}
+
+fn verify_required_cuda_runtime_in(cuda_path: &Path) -> eyre::Result<PathBuf> {
+    let nvrtc_path = cuda_path.join("bin").join(REQUIRED_CUDA_NVRTC_DLL_NAME);
+    if !nvrtc_path.is_file() {
+        eyre::bail!(
+            "CUDA {REQUIRED_CUDA_MAJOR_VERSION}.{REQUIRED_CUDA_MINOR_VERSION} NVRTC is required at {}; install the nvrtc_13.3 toolkit component",
+            nvrtc_path.display()
+        );
+    }
+    Ok(nvrtc_path)
+}
+
+fn verify_cuda_runtime_is_on_path(nvrtc_path: &Path) -> eyre::Result<()> {
+    let bin_dir = nvrtc_path.parent().ok_or_else(|| {
+        eyre::eyre!(
+            "NVRTC path has no parent directory: {}",
+            nvrtc_path.display()
+        )
+    })?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    if std::env::split_paths(&path).any(|entry| same_runtime_directory(&entry, bin_dir)) {
+        return Ok(());
+    }
+    eyre::bail!(
+        "CUDA NVRTC directory {} is not on PATH; add it before running teamy-llm",
+        bin_dir.display()
+    );
+}
+
+fn same_runtime_directory(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn verify_required_cuda_driver() -> eyre::Result<()> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=driver_version", "--format=csv,noheader"])
+        .output()
+        .wrap_err("Failed to query the NVIDIA driver with nvidia-smi")?;
+    if !output.status.success() {
+        eyre::bail!("nvidia-smi failed while checking CUDA driver compatibility");
+    }
+    let driver_version = String::from_utf8_lossy(&output.stdout);
+    let driver_major = parse_nvidia_driver_major(&driver_version).ok_or_else(|| {
+        eyre::eyre!(
+            "Could not parse NVIDIA driver version `{}`",
+            driver_version.trim()
+        )
+    })?;
+    if driver_major < REQUIRED_CUDA_MIN_DRIVER_MAJOR_VERSION {
+        eyre::bail!(
+            "CUDA {REQUIRED_CUDA_MAJOR_VERSION}.x requires NVIDIA driver {} or newer, but found {}",
+            REQUIRED_CUDA_MIN_DRIVER_MAJOR_VERSION,
+            driver_version.trim()
+        );
+    }
+    Ok(())
+}
+
+fn parse_nvidia_driver_major(value: &str) -> Option<u32> {
+    value.trim().split('.').next()?.parse().ok()
+}
 
 macro_rules! llm_tracy_zone {
     ($name:literal) => {
@@ -3346,25 +3442,15 @@ fn generate_with_burn_text_runtime_inner(
     options: &BurnTextGenerationOptions,
     mut token_sink: Option<&mut dyn GenerationEventSink>,
 ) -> eyre::Result<BurnTextGenerationReport> {
+    verify_required_cuda_runtime()?;
     let generation_mode = burn_text_generation_mode();
-    if burn_text_prefers_cuda_by_default()
-        && let Some(report) = try_generate_with_cuda_backend(
-            artifacts,
-            prompt_token_ids,
-            options,
-            generation_mode,
-            &mut token_sink,
-        )?
-    {
-        return Ok(report);
-    }
-    generate_with_selected_burn_text_runtime_on_device::<LlmCpuBackend>(
+    generate_with_selected_burn_text_runtime_on_device::<LlmCudaBackend>(
         artifacts,
         prompt_token_ids,
         options,
         generation_mode,
-        NdArrayDevice::default(),
-        "cpu-ndarray",
+        llm_inference_cuda_device(),
+        "cuda",
         &mut token_sink,
     )
 }
@@ -3378,18 +3464,13 @@ pub fn compare_with_incremental_burn_text_runtime(
     prompt_token_ids: &[u32],
     options: &BurnTextGenerationOptions,
 ) -> eyre::Result<BurnTextIncrementalComparisonReport> {
-    if burn_text_prefers_cuda_by_default()
-        && let Some(report) =
-            try_compare_with_incremental_cuda_backend(artifacts, prompt_token_ids, options)?
-    {
-        return Ok(report);
-    }
-    compare_with_incremental_burn_text_runtime_on_device::<LlmCpuBackend>(
+    verify_required_cuda_runtime()?;
+    compare_with_incremental_burn_text_runtime_on_device::<LlmCudaBackend>(
         artifacts,
         prompt_token_ids,
         options,
-        NdArrayDevice::default(),
-        "cpu-ndarray",
+        llm_inference_cuda_device(),
+        "cuda",
     )
 }
 
@@ -3401,17 +3482,12 @@ pub fn diagnose_incremental_hidden_burn_text_runtime(
     artifacts: &LlmModelArtifacts,
     prompt_token_ids: &[u32],
 ) -> eyre::Result<BurnTextIncrementalHiddenDiagnosticsReport> {
-    if burn_text_prefers_cuda_by_default()
-        && let Some(report) =
-            try_diagnose_incremental_hidden_cuda_backend(artifacts, prompt_token_ids)?
-    {
-        return Ok(report);
-    }
-    diagnose_incremental_hidden_burn_text_runtime_on_device::<LlmCpuBackend>(
+    verify_required_cuda_runtime()?;
+    diagnose_incremental_hidden_burn_text_runtime_on_device::<LlmCudaBackend>(
         artifacts,
         prompt_token_ids,
-        NdArrayDevice::default(),
-        "cpu-ndarray",
+        llm_inference_cuda_device(),
+        "cuda",
     )
 }
 
@@ -3423,17 +3499,12 @@ pub fn diagnose_incremental_layers_burn_text_runtime(
     artifacts: &LlmModelArtifacts,
     prompt_token_ids: &[u32],
 ) -> eyre::Result<BurnTextIncrementalLayerDiagnosticsReport> {
-    if burn_text_prefers_cuda_by_default()
-        && let Some(report) =
-            try_diagnose_incremental_layers_cuda_backend(artifacts, prompt_token_ids)?
-    {
-        return Ok(report);
-    }
-    diagnose_incremental_layers_burn_text_runtime_on_device::<LlmCpuBackend>(
+    verify_required_cuda_runtime()?;
+    diagnose_incremental_layers_burn_text_runtime_on_device::<LlmCudaBackend>(
         artifacts,
         prompt_token_ids,
-        NdArrayDevice::default(),
-        "cpu-ndarray",
+        llm_inference_cuda_device(),
+        "cuda",
     )
 }
 
@@ -3445,30 +3516,18 @@ pub fn collect_full_layer_outputs_burn_text_runtime(
     artifacts: &LlmModelArtifacts,
     prompt_token_ids: &[u32],
 ) -> eyre::Result<BurnTextLayerOutputsReport> {
-    if burn_text_prefers_cuda_by_default()
-        && let Some(report) =
-            try_collect_full_layer_outputs_cuda_backend(artifacts, prompt_token_ids)?
-    {
-        return Ok(report);
-    }
-    collect_full_layer_outputs_burn_text_runtime_on_device::<LlmCpuBackend>(
+    verify_required_cuda_runtime()?;
+    collect_full_layer_outputs_burn_text_runtime_on_device::<LlmCudaBackend>(
         artifacts,
         prompt_token_ids,
-        NdArrayDevice::default(),
-        "cpu-ndarray",
+        llm_inference_cuda_device(),
+        "cuda",
     )
 }
 
 #[must_use]
 pub fn llm_inference_cuda_device() -> CudaDevice {
     CudaDevice::default()
-}
-
-fn burn_text_prefers_cuda_by_default() -> bool {
-    !matches!(
-        std::env::var("TEAMY_STUDIO_LLM_BACKEND"),
-        Ok(value) if value.trim().eq_ignore_ascii_case("cpu")
-    )
 }
 
 fn burn_text_generation_mode() -> BurnTextGenerationMode {
@@ -3517,165 +3576,6 @@ fn generate_with_selected_burn_text_runtime_on_device<B: Backend>(
             backend_label,
             token_sink,
         ),
-    }
-}
-
-fn try_generate_with_cuda_backend(
-    artifacts: &LlmModelArtifacts,
-    prompt_token_ids: &[u32],
-    options: &BurnTextGenerationOptions,
-    generation_mode: BurnTextGenerationMode,
-    token_sink: &mut Option<&mut dyn GenerationEventSink>,
-) -> eyre::Result<Option<BurnTextGenerationReport>> {
-    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        generate_with_selected_burn_text_runtime_on_device::<LlmCudaBackend>(
-            artifacts,
-            prompt_token_ids,
-            options,
-            generation_mode,
-            llm_inference_cuda_device(),
-            "cuda",
-            token_sink,
-        )
-    }));
-    match attempt {
-        Ok(Ok(report)) => Ok(Some(report)),
-        Ok(Err(error)) => {
-            if is_generation_timeout_error(&error) || is_generation_cancelled_error(&error) {
-                return Err(error);
-            }
-            trace_burn_text_runtime(&format!(
-                "CUDA backend unavailable for Burn text runtime; falling back to CPU: {error}"
-            ));
-            Ok(None)
-        }
-        Err(_) => {
-            trace_burn_text_runtime(
-                "CUDA backend panicked during Burn text runtime initialization; falling back to CPU",
-            );
-            Ok(None)
-        }
-    }
-}
-
-fn try_compare_with_incremental_cuda_backend(
-    artifacts: &LlmModelArtifacts,
-    prompt_token_ids: &[u32],
-    options: &BurnTextGenerationOptions,
-) -> eyre::Result<Option<BurnTextIncrementalComparisonReport>> {
-    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        compare_with_incremental_burn_text_runtime_on_device::<LlmCudaBackend>(
-            artifacts,
-            prompt_token_ids,
-            options,
-            llm_inference_cuda_device(),
-            "cuda",
-        )
-    }));
-    match attempt {
-        Ok(Ok(report)) => Ok(Some(report)),
-        Ok(Err(error)) => {
-            if is_generation_timeout_error(&error) || is_generation_cancelled_error(&error) {
-                return Err(error);
-            }
-            trace_burn_text_runtime(&format!(
-                "CUDA backend unavailable for Burn incremental comparison; falling back to CPU: {error}"
-            ));
-            Ok(None)
-        }
-        Err(_) => {
-            trace_burn_text_runtime(
-                "CUDA backend panicked during Burn incremental comparison initialization; falling back to CPU",
-            );
-            Ok(None)
-        }
-    }
-}
-
-fn try_diagnose_incremental_hidden_cuda_backend(
-    artifacts: &LlmModelArtifacts,
-    prompt_token_ids: &[u32],
-) -> eyre::Result<Option<BurnTextIncrementalHiddenDiagnosticsReport>> {
-    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        diagnose_incremental_hidden_burn_text_runtime_on_device::<LlmCudaBackend>(
-            artifacts,
-            prompt_token_ids,
-            llm_inference_cuda_device(),
-            "cuda",
-        )
-    }));
-    match attempt {
-        Ok(Ok(report)) => Ok(Some(report)),
-        Ok(Err(error)) => {
-            trace_burn_text_runtime(&format!(
-                "CUDA backend unavailable for Burn incremental hidden diagnostics; falling back to CPU: {error}"
-            ));
-            Ok(None)
-        }
-        Err(_) => {
-            trace_burn_text_runtime(
-                "CUDA backend panicked during Burn incremental hidden diagnostics; falling back to CPU",
-            );
-            Ok(None)
-        }
-    }
-}
-
-fn try_diagnose_incremental_layers_cuda_backend(
-    artifacts: &LlmModelArtifacts,
-    prompt_token_ids: &[u32],
-) -> eyre::Result<Option<BurnTextIncrementalLayerDiagnosticsReport>> {
-    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        diagnose_incremental_layers_burn_text_runtime_on_device::<LlmCudaBackend>(
-            artifacts,
-            prompt_token_ids,
-            llm_inference_cuda_device(),
-            "cuda",
-        )
-    }));
-    match attempt {
-        Ok(Ok(report)) => Ok(Some(report)),
-        Ok(Err(error)) => {
-            trace_burn_text_runtime(&format!(
-                "CUDA backend unavailable for Burn incremental layer diagnostics; falling back to CPU: {error}"
-            ));
-            Ok(None)
-        }
-        Err(_) => {
-            trace_burn_text_runtime(
-                "CUDA backend panicked during Burn incremental layer diagnostics; falling back to CPU",
-            );
-            Ok(None)
-        }
-    }
-}
-
-fn try_collect_full_layer_outputs_cuda_backend(
-    artifacts: &LlmModelArtifacts,
-    prompt_token_ids: &[u32],
-) -> eyre::Result<Option<BurnTextLayerOutputsReport>> {
-    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        collect_full_layer_outputs_burn_text_runtime_on_device::<LlmCudaBackend>(
-            artifacts,
-            prompt_token_ids,
-            llm_inference_cuda_device(),
-            "cuda",
-        )
-    }));
-    match attempt {
-        Ok(Ok(report)) => Ok(Some(report)),
-        Ok(Err(error)) => {
-            trace_burn_text_runtime(&format!(
-                "CUDA backend unavailable for Burn full-layer outputs; falling back to CPU: {error}"
-            ));
-            Ok(None)
-        }
-        Err(_) => {
-            trace_burn_text_runtime(
-                "CUDA backend panicked during Burn full-layer outputs; falling back to CPU",
-            );
-            Ok(None)
-        }
     }
 }
 
@@ -5623,11 +5523,13 @@ fn softplus_scalar(value: f32) -> f32 {
 mod tests {
     use super::{
         BURN_TEXT_DIR_NAME, BURN_TEXT_MANIFEST_FILE_NAME, BurnTextManifest, BurnTextTensorSpec,
-        CancellationToken, LlmCpuBackend, SOURCE_SAFETENSORS_INDEX_FILE_NAME, apply_rotary_slice,
+        CancellationToken, LlmCpuBackend, REQUIRED_CUDA_MIN_DRIVER_MAJOR_VERSION,
+        REQUIRED_CUDA_NVRTC_DLL_NAME, SOURCE_SAFETENSORS_INDEX_FILE_NAME, apply_rotary_slice,
         bytes_per_element, causal_mask, check_generation_cancellation, decode_bytes_into_f32,
         dot_product, export_burn_text_weights, f16_bits_to_f32, first_mismatch_index,
-        inspect_burn_text_runtime_status, is_generation_cancelled_error, rotary_embeddings,
-        sigmoid_scalar, softmax_scalars, softmax_scalars_in_place,
+        inspect_burn_text_runtime_status, is_generation_cancelled_error, parse_nvidia_driver_major,
+        rotary_embeddings, sigmoid_scalar, softmax_scalars, softmax_scalars_in_place,
+        verify_required_cuda_runtime, verify_required_cuda_runtime_in,
     };
     use crate::model::{
         DEFAULT_LLM_MODEL_NAME, HF_CONFIG_FILE_NAME, MODEL_FILE_NAME, TOKENIZER_CONFIG_FILE_NAME,
@@ -5658,6 +5560,38 @@ mod tests {
             .expect_err("cancelled token should stop generation");
 
         assert!(is_generation_cancelled_error(&error));
+    }
+
+    #[test]
+    fn cuda_13_3_runtime_contract_requires_the_expected_nvrtc_dll() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cuda_root = temp.path().join("cuda-13.3");
+        let bin_dir = cuda_root.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create CUDA bin directory");
+        let expected_nvrtc = bin_dir.join(REQUIRED_CUDA_NVRTC_DLL_NAME);
+        std::fs::write(&expected_nvrtc, []).expect("create NVRTC fixture");
+
+        let found = verify_required_cuda_runtime_in(&cuda_root).expect("CUDA 13.3 should match");
+
+        assert_eq!(found, expected_nvrtc);
+    }
+
+    #[test]
+    fn cuda_13_x_requires_a_supported_nvidia_driver_series() {
+        let supported = parse_nvidia_driver_major("591.86\n").expect("supported driver parses");
+        let unsupported = parse_nvidia_driver_major("579.99").expect("old driver parses");
+        assert!(supported >= REQUIRED_CUDA_MIN_DRIVER_MAJOR_VERSION);
+        assert!(unsupported < REQUIRED_CUDA_MIN_DRIVER_MAJOR_VERSION);
+        assert_eq!(parse_nvidia_driver_major("not-a-driver"), None);
+    }
+
+    #[test]
+    fn installed_cuda_runtime_matches_contract_when_cuda_path_is_configured() {
+        let Some(_) = std::env::var_os("CUDA_PATH") else {
+            return;
+        };
+
+        verify_required_cuda_runtime().expect("configured CUDA runtime should meet requirements");
     }
 
     #[test]
