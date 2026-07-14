@@ -23,3 +23,7 @@ tempfile.workspace = true
 [features]
 default = []
 vox = ["dep:vox"]
+tracy = [
+    "teamy_llm_burn_qwen35/tracy",
+    "teamy_llm_burn_qwen35/extended_observability",
+]

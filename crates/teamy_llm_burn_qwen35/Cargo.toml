@@ -32,4 +32,4 @@ tempfile.workspace = true
 [features]
 default = []
 extended_observability = []
-tracing_subscriber_tracy = ["dep:tracy-client"]
+tracy = ["dep:tracy-client"]

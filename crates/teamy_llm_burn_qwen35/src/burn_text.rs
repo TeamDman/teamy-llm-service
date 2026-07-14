@@ -202,7 +202,7 @@ fn cuda_runtime_version_is_compatible(version: (u32, u32)) -> bool {
 
 macro_rules! llm_tracy_zone {
     ($name:literal) => {
-        #[cfg(feature = "tracing_subscriber_tracy")]
+        #[cfg(feature = "tracy")]
         let _tracy_zone = tracy_client::span!($name, 0);
     };
 }

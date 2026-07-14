@@ -58,6 +58,28 @@ post-first-token decode throughput (`generated token count / (completion - first
 mode in a new process (`--no-thinking` or `--thinking`) for a process-cold comparison; run both in
 one invocation to observe the long-lived CUDA runtime cache's warm follow-up request.
 
+## CPU profiling
+
+The Burn backend has optional Tracy CPU zones around the decode path. This is an opt-in feature:
+the normal build has no Tracy dependency. Its client disables default features and uses
+`only-localhost`, matching `teamy-rust-cli`; it will not use broadcast discovery or request a
+Windows firewall exception. With the Tracy capture UI listening, enable it only for the profiling
+build:
+
+```text
+cargo run --release -p teamy_llm_cli --features tracy -- benchmark --no-thinking --max-new-tokens 64 --timeout-ms 600000
+```
+
+Save the resulting `.tracy` capture, then use the local `teamy-profiler` repository to rank the
+exclusive CPU time of its spans:
+
+```text
+teamy-profiler tracy csv export <capture.tracy> --top 25 --table
+```
+
+This exposes host-side work and synchronization in the current hybrid decode path. It does not
+replace a GPU-timing tool when kernel-level CUDA timings are required.
+
 ## CUDA runtime
 
 This is a GPU-only program: it does not fall back to CPU inference. The workspace pins Cudarc to the

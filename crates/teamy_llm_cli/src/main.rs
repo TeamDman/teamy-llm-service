@@ -16,14 +16,20 @@ async fn main() -> Result<()> {
     let cancellation_token = CtrlCHandler::default().install()?;
     let _stop_after_duration_thread =
         stop_after.start_stop_after_duration_thread(cancellation_token.clone())?;
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::registry()
+    tracing::subscriber::set_global_default({
+        let subscriber = tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_filter(tracing_subscriber::EnvFilter::from_default_env()),
             )
-            .with(stop_after.stop_after_span_layer(cancellation_token.clone())),
-    )?;
+            .with(stop_after.stop_after_span_layer(cancellation_token.clone()));
+        #[cfg(feature = "tracy")]
+        let subscriber = subscriber.with(
+            tracing_tracy::TracyLayer::default()
+                .with_filter(tracing_subscriber::filter::LevelFilter::TRACE),
+        );
+        subscriber
+    })?;
 
     if args.is_empty() {
         print_help();
