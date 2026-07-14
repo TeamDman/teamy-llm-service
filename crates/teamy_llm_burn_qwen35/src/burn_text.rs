@@ -185,7 +185,11 @@ fn parse_nvidia_driver_major(value: &str) -> Option<u32> {
 fn parse_nvidia_smi_cuda_version(value: &str) -> Option<(u32, u32)> {
     let version = value
         .lines()
-        .find_map(|line| line.split_once("CUDA Version:").map(|(_, value)| value))?
+        .find_map(|line| {
+            ["CUDA UMD Version:", "CUDA Version:"]
+                .into_iter()
+                .find_map(|label| line.split_once(label).map(|(_, value)| value))
+        })?
         .split_whitespace()
         .next()?;
     let (major, minor) = version.split_once('.')?;
@@ -5651,7 +5655,7 @@ mod tests {
         )
         .expect("CUDA version parses");
         let matching_driver = parse_nvidia_smi_cuda_version(
-            "| NVIDIA-SMI 600.00       Driver Version: 600.00       CUDA Version: 13.3     |",
+            "| NVIDIA-SMI 610.62       KMD Version: 610.62        CUDA UMD Version: 13.3 |",
         )
         .expect("CUDA version parses");
 
