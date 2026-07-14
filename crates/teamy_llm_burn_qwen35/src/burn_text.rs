@@ -50,14 +50,18 @@ pub type LlmCpuBackend = NdArray<f32>;
 pub const REQUIRED_CUDA_MAJOR_VERSION: u32 = 13;
 pub const REQUIRED_CUDA_MINOR_VERSION: u32 = 3;
 pub const REQUIRED_CUDA_MIN_DRIVER_MAJOR_VERSION: u32 = 580;
-pub const REQUIRED_CUDA_NVRTC_DLL_NAME: &str = "nvrtc64_133_0.dll";
+// CUDA 13.3.1 for Windows keeps the NVRTC ABI DLL at the 13.0 ABI name while its matching
+// builtins DLL carries the toolkit minor version. Cudarc 0.19.8 tries `nvrtc64_130_0.dll` as
+// its CUDA 13.3 compatibility candidate.
+pub const REQUIRED_CUDA_NVRTC_DLL_NAME: &str = "nvrtc64_130_0.dll";
+pub const REQUIRED_CUDA_NVRTC_BUILTINS_DLL_NAME: &str = "nvrtc-builtins64_133.dll";
 
 /// Verify that the CUDA 13.3 runtime required by the GPU-only backend is available.
 ///
 /// # Errors
 ///
-/// Returns an error when `CUDA_PATH` is absent, NVRTC 13.3 is missing from the process DLL search
-/// path, or the NVIDIA driver is older than the CUDA 13.x minimum compatibility range.
+/// Returns an error when `CUDA_PATH` is absent, the CUDA 13.3 NVRTC pair is missing, or the
+/// NVIDIA driver is older than the CUDA 13.x minimum compatibility range.
 pub fn verify_required_cuda_runtime() -> eyre::Result<PathBuf> {
     let cuda_path = std::env::var_os("CUDA_PATH").ok_or_else(|| {
         eyre::eyre!(
@@ -65,50 +69,64 @@ pub fn verify_required_cuda_runtime() -> eyre::Result<PathBuf> {
         )
     })?;
     let nvrtc_path = verify_required_cuda_runtime_in(Path::new(&cuda_path))?;
-    verify_cuda_runtime_is_on_path(&nvrtc_path)?;
+    configure_cuda_runtime_dll_search_path(&nvrtc_path)?;
     verify_required_cuda_driver()?;
     Ok(nvrtc_path)
 }
 
 fn verify_required_cuda_runtime_in(cuda_path: &Path) -> eyre::Result<PathBuf> {
-    let nvrtc_path = cuda_path.join("bin").join(REQUIRED_CUDA_NVRTC_DLL_NAME);
+    let runtime_dir = cuda_path.join("bin").join("x64");
+    let nvrtc_path = runtime_dir.join(REQUIRED_CUDA_NVRTC_DLL_NAME);
     if !nvrtc_path.is_file() {
         eyre::bail!(
             "CUDA {REQUIRED_CUDA_MAJOR_VERSION}.{REQUIRED_CUDA_MINOR_VERSION} NVRTC is required at {}; install the nvrtc_13.3 toolkit component",
             nvrtc_path.display()
         );
     }
+    let builtins_path = runtime_dir.join(REQUIRED_CUDA_NVRTC_BUILTINS_DLL_NAME);
+    if !builtins_path.is_file() {
+        eyre::bail!(
+            "CUDA {REQUIRED_CUDA_MAJOR_VERSION}.{REQUIRED_CUDA_MINOR_VERSION} NVRTC builtins are required at {}; install the nvrtc_13.3 toolkit component",
+            builtins_path.display()
+        );
+    }
     Ok(nvrtc_path)
 }
 
-fn verify_cuda_runtime_is_on_path(nvrtc_path: &Path) -> eyre::Result<()> {
-    let bin_dir = nvrtc_path.parent().ok_or_else(|| {
+fn configure_cuda_runtime_dll_search_path(nvrtc_path: &Path) -> eyre::Result<()> {
+    let runtime_dir = nvrtc_path.parent().ok_or_else(|| {
         eyre::eyre!(
             "NVRTC path has no parent directory: {}",
             nvrtc_path.display()
         )
     })?;
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    if std::env::split_paths(&path).any(|entry| same_runtime_directory(&entry, bin_dir)) {
-        return Ok(());
-    }
-    eyre::bail!(
-        "CUDA NVRTC directory {} is not on PATH; add it before running teamy-llm",
-        bin_dir.display()
-    );
-}
 
-fn same_runtime_directory(left: &Path, right: &Path) -> bool {
     #[cfg(windows)]
     {
-        left.as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+        use std::os::windows::ffi::OsStrExt;
+
+        let wide_runtime_dir = runtime_dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        // SAFETY: `wide_runtime_dir` is NUL-terminated and remains valid throughout the call.
+        if unsafe { SetDllDirectoryW(wide_runtime_dir.as_ptr()) } == 0 {
+            return Err(std::io::Error::last_os_error()).wrap_err_with(|| {
+                format!(
+                    "Failed to add CUDA NVRTC directory {} to this process's DLL search path",
+                    runtime_dir.display()
+                )
+            });
+        }
     }
-    #[cfg(not(windows))]
-    {
-        left == right
-    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn SetDllDirectoryW(lp_path_name: *const u16) -> i32;
 }
 
 fn verify_required_cuda_driver() -> eyre::Result<()> {
@@ -133,11 +151,49 @@ fn verify_required_cuda_driver() -> eyre::Result<()> {
             driver_version.trim()
         );
     }
+
+    let nvidia_smi_output = std::process::Command::new("nvidia-smi")
+        .output()
+        .wrap_err("Failed to query the CUDA version supported by the NVIDIA driver")?;
+    if !nvidia_smi_output.status.success() {
+        eyre::bail!("nvidia-smi failed while checking the CUDA version supported by the driver");
+    }
+    let nvidia_smi_output = String::from_utf8_lossy(&nvidia_smi_output.stdout);
+    let supported_cuda_version =
+        parse_nvidia_smi_cuda_version(&nvidia_smi_output).ok_or_else(|| {
+            eyre::eyre!(
+                "Could not parse the CUDA Version reported by nvidia-smi: `{}`",
+                nvidia_smi_output.trim()
+            )
+        })?;
+    if !cuda_runtime_version_is_compatible(supported_cuda_version) {
+        eyre::bail!(
+            "CUDA {REQUIRED_CUDA_MAJOR_VERSION}.{REQUIRED_CUDA_MINOR_VERSION} runtime compilation requires an NVIDIA driver whose nvidia-smi reports CUDA Version {}.{} or newer, but found {}.{}; upgrade the NVIDIA driver",
+            REQUIRED_CUDA_MAJOR_VERSION,
+            REQUIRED_CUDA_MINOR_VERSION,
+            supported_cuda_version.0,
+            supported_cuda_version.1,
+        );
+    }
     Ok(())
 }
 
 fn parse_nvidia_driver_major(value: &str) -> Option<u32> {
     value.trim().split('.').next()?.parse().ok()
+}
+
+fn parse_nvidia_smi_cuda_version(value: &str) -> Option<(u32, u32)> {
+    let version = value
+        .lines()
+        .find_map(|line| line.split_once("CUDA Version:").map(|(_, value)| value))?
+        .split_whitespace()
+        .next()?;
+    let (major, minor) = version.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+fn cuda_runtime_version_is_compatible(version: (u32, u32)) -> bool {
+    version >= (REQUIRED_CUDA_MAJOR_VERSION, REQUIRED_CUDA_MINOR_VERSION)
 }
 
 macro_rules! llm_tracy_zone {
@@ -5524,12 +5580,13 @@ mod tests {
     use super::{
         BURN_TEXT_DIR_NAME, BURN_TEXT_MANIFEST_FILE_NAME, BurnTextManifest, BurnTextTensorSpec,
         CancellationToken, LlmCpuBackend, REQUIRED_CUDA_MIN_DRIVER_MAJOR_VERSION,
-        REQUIRED_CUDA_NVRTC_DLL_NAME, SOURCE_SAFETENSORS_INDEX_FILE_NAME, apply_rotary_slice,
-        bytes_per_element, causal_mask, check_generation_cancellation, decode_bytes_into_f32,
+        REQUIRED_CUDA_NVRTC_BUILTINS_DLL_NAME, REQUIRED_CUDA_NVRTC_DLL_NAME,
+        SOURCE_SAFETENSORS_INDEX_FILE_NAME, apply_rotary_slice, bytes_per_element, causal_mask,
+        check_generation_cancellation, cuda_runtime_version_is_compatible, decode_bytes_into_f32,
         dot_product, export_burn_text_weights, f16_bits_to_f32, first_mismatch_index,
         inspect_burn_text_runtime_status, is_generation_cancelled_error, parse_nvidia_driver_major,
-        rotary_embeddings, sigmoid_scalar, softmax_scalars, softmax_scalars_in_place,
-        verify_required_cuda_runtime, verify_required_cuda_runtime_in,
+        parse_nvidia_smi_cuda_version, rotary_embeddings, sigmoid_scalar, softmax_scalars,
+        softmax_scalars_in_place, verify_required_cuda_runtime, verify_required_cuda_runtime_in,
     };
     use crate::model::{
         DEFAULT_LLM_MODEL_NAME, HF_CONFIG_FILE_NAME, MODEL_FILE_NAME, TOKENIZER_CONFIG_FILE_NAME,
@@ -5566,10 +5623,12 @@ mod tests {
     fn cuda_13_3_runtime_contract_requires_the_expected_nvrtc_dll() {
         let temp = tempfile::tempdir().expect("temp dir");
         let cuda_root = temp.path().join("cuda-13.3");
-        let bin_dir = cuda_root.join("bin");
+        let bin_dir = cuda_root.join("bin").join("x64");
         std::fs::create_dir_all(&bin_dir).expect("create CUDA bin directory");
         let expected_nvrtc = bin_dir.join(REQUIRED_CUDA_NVRTC_DLL_NAME);
+        let expected_builtins = bin_dir.join(REQUIRED_CUDA_NVRTC_BUILTINS_DLL_NAME);
         std::fs::write(&expected_nvrtc, []).expect("create NVRTC fixture");
+        std::fs::write(&expected_builtins, []).expect("create NVRTC builtins fixture");
 
         let found = verify_required_cuda_runtime_in(&cuda_root).expect("CUDA 13.3 should match");
 
@@ -5586,6 +5645,22 @@ mod tests {
     }
 
     #[test]
+    fn cuda_13_3_runtime_compilation_rejects_a_driver_that_only_supports_cuda_13_1() {
+        let older_driver = parse_nvidia_smi_cuda_version(
+            "| NVIDIA-SMI 591.86       Driver Version: 591.86       CUDA Version: 13.1     |",
+        )
+        .expect("CUDA version parses");
+        let matching_driver = parse_nvidia_smi_cuda_version(
+            "| NVIDIA-SMI 600.00       Driver Version: 600.00       CUDA Version: 13.3     |",
+        )
+        .expect("CUDA version parses");
+
+        assert!(!cuda_runtime_version_is_compatible(older_driver));
+        assert!(cuda_runtime_version_is_compatible(matching_driver));
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA 13.3-capable NVIDIA driver on this host"]
     fn installed_cuda_runtime_matches_contract_when_cuda_path_is_configured() {
         let Some(_) = std::env::var_os("CUDA_PATH") else {
             return;

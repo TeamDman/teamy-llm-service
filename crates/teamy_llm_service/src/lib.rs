@@ -8,7 +8,7 @@ use teamy_llm_burn_qwen35::burn_backend::{BurnLlmSupportState, inspect_burn_runt
 use teamy_llm_burn_qwen35::burn_text::{
     BurnTextGenerationOptions, GenerationEventSink as BackendGenerationEventSink,
     generate_with_burn_text_runtime_to_sink, is_generation_cancelled_error,
-    is_generation_timeout_error,
+    is_generation_timeout_error, verify_required_cuda_runtime,
 };
 use teamy_llm_burn_qwen35::model::{
     DEFAULT_LLM_MODEL_NAME, LlmModelArtifacts, LlmModelPreparationState, inspect_model_dir,
@@ -167,6 +167,8 @@ impl TeamyLlmService {
         cancellation_token: Option<CancellationToken>,
         sink: &mut impl GenerateEventSink,
     ) -> Result<GenerateResult, ServiceError> {
+        check_cancelled(cancellation_token.as_ref())?;
+        verify_required_cuda_runtime().map_err(map_generation_error)?;
         check_cancelled(cancellation_token.as_ref())?;
         let model_dir = self.resolve_model_dir(&request.selector)?;
         check_cancelled(cancellation_token.as_ref())?;
