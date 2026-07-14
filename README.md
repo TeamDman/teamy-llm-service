@@ -43,6 +43,21 @@ A long-lived `TeamyLlmService` also retains the default hybrid CUDA runtime per 
 first request. This reuses lazily populated GPU weight caches for later requests; preparing a model
 invalidates its cached runtime so updated weights are never reused.
 
+## Performance baseline
+
+The benchmark command defaults to the fixed prompt `Why is the sky blue?`, a 200-token cap, and
+both native prompt modes. It prints one machine-readable row per mode:
+
+```text
+cargo run --release -p teamy_llm_cli -- benchmark --timeout-ms 600000
+```
+
+`time_to_first_token_ms` starts when the request is submitted, so it includes model loading and
+prompt processing. `time_to_completion_ms` covers the entire request. `tokens_per_second` is the
+post-first-token decode throughput (`generated token count / (completion - first token)`). Run each
+mode in a new process (`--no-thinking` or `--thinking`) for a process-cold comparison; run both in
+one invocation to observe the long-lived CUDA runtime cache's warm follow-up request.
+
 ## CUDA runtime
 
 This is a GPU-only program: it does not fall back to CPU inference. The workspace pins Cudarc to the

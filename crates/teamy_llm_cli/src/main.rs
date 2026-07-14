@@ -1,5 +1,6 @@
 use std::env;
 use std::io::{self, Write};
+use std::time::{Duration, Instant};
 
 use color_eyre::eyre::{Result, bail, eyre};
 use teamy_cancellation::{CancellationToken, CtrlCHandler, StopAfterArgs};
@@ -46,6 +47,7 @@ async fn main() -> Result<()> {
         }
         "model" => run_model(service, args).await?,
         "prompt" => run_prompt(service, args, cancellation_token.clone())?,
+        "benchmark" => run_benchmark(service, args, cancellation_token.clone())?,
         "help" | "--help" | "-h" => print_help(),
         other => bail!("unknown command `{other}`"),
     }
@@ -171,6 +173,140 @@ fn run_prompt(
     Ok(())
 }
 
+/// Measures a complete request from submission to final token.  `time_to_first_token_ms` therefore
+/// includes CUDA validation, model initialization, prompt processing, and the first decode step.
+/// `tokens_per_second` measures decode throughput after the first token arrives.
+fn run_benchmark(
+    service: TeamyLlmService,
+    mut args: Vec<String>,
+    cancellation_token: CancellationToken,
+) -> Result<()> {
+    let model = take_option_value(&mut args, "--model");
+    let model_dir = take_option_value(&mut args, "--model-dir");
+    let system_prompt = take_option_value(&mut args, "--system-prompt");
+    let thinking_modes = benchmark_thinking_modes_from_args(&mut args)?;
+    let max_new_tokens = take_option_value(&mut args, "--max-new-tokens")
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(200);
+    let timeout_ms = take_option_value(&mut args, "--timeout-ms")
+        .map(|value| value.parse::<u64>())
+        .transpose()?;
+    let user_prompt = if args.is_empty() {
+        "Why is the sky blue?".to_owned()
+    } else {
+        args.join(" ")
+    };
+
+    for thinking_mode in thinking_modes {
+        run_benchmark_case(
+            &service,
+            GenerateRequest {
+                selector: ModelSelector {
+                    model: model.clone(),
+                    model_dir: model_dir.clone(),
+                },
+                system_prompt: system_prompt.clone(),
+                user_prompt: user_prompt.clone(),
+                thinking_mode,
+                max_new_tokens,
+                timeout_ms,
+            },
+            cancellation_token.clone(),
+        )?;
+    }
+    Ok(())
+}
+
+fn run_benchmark_case(
+    service: &TeamyLlmService,
+    request: GenerateRequest,
+    cancellation_token: CancellationToken,
+) -> Result<()> {
+    let started_at = Instant::now();
+    let mut first_token_at = None;
+    let mode = thinking_mode_name(request.thinking_mode);
+    let result =
+        service.generate_with_cancellation(request, Some(cancellation_token), &mut |event| {
+            if matches!(event, GenerateEvent::Token { .. }) && first_token_at.is_none() {
+                first_token_at = Some(Instant::now());
+            }
+            Ok(())
+        });
+    let completed_at = Instant::now();
+    let time_to_first_token = first_token_at.map(|first_token_at| first_token_at - started_at);
+    let elapsed = completed_at - started_at;
+
+    match result {
+        Ok(result) => {
+            let token_count = result.generated_token_ids.len();
+            let tokens_per_second = time_to_first_token
+                .map(|first_token| tokens_per_second(token_count, elapsed - first_token));
+            print_benchmark_result(
+                mode,
+                token_count,
+                time_to_first_token,
+                elapsed,
+                tokens_per_second,
+                "completed",
+            );
+            Ok(())
+        }
+        Err(error) => {
+            print_benchmark_result(mode, 0, time_to_first_token, elapsed, None, "failed");
+            bail!(error.to_string())
+        }
+    }
+}
+
+fn benchmark_thinking_modes_from_args(args: &mut Vec<String>) -> Result<Vec<ThinkingMode>> {
+    let thinking = take_flag(args, "--thinking");
+    let direct = take_flag(args, "--no-thinking");
+    let both = take_flag(args, "--both-thinking-modes");
+    if both && (thinking || direct) {
+        bail!("`--both-thinking-modes` cannot be combined with `--thinking` or `--no-thinking`");
+    }
+    if thinking && direct {
+        bail!("`--thinking` and `--no-thinking` cannot be used together");
+    }
+    Ok(if thinking {
+        vec![ThinkingMode::Thinking]
+    } else if direct {
+        vec![ThinkingMode::Direct]
+    } else {
+        vec![ThinkingMode::Direct, ThinkingMode::Thinking]
+    })
+}
+
+fn thinking_mode_name(mode: ThinkingMode) -> &'static str {
+    match mode {
+        ThinkingMode::Direct => "direct",
+        ThinkingMode::Thinking => "thinking",
+    }
+}
+
+fn tokens_per_second(token_count: usize, duration: Duration) -> f64 {
+    token_count as f64 / duration.as_secs_f64()
+}
+
+fn print_benchmark_result(
+    mode: &str,
+    token_count: usize,
+    time_to_first_token: Option<Duration>,
+    time_to_completion: Duration,
+    tokens_per_second: Option<f64>,
+    status: &str,
+) {
+    let time_to_first_token_ms = time_to_first_token
+        .map(|duration| duration.as_secs_f64() * 1_000.0)
+        .unwrap_or(f64::NAN);
+    let tokens_per_second = tokens_per_second.unwrap_or(f64::NAN);
+    println!(
+        "benchmark status={status} mode={mode} token_count={token_count} time_to_first_token_ms={time_to_first_token_ms:.3} time_to_completion_ms={:.3} tokens_per_second={tokens_per_second:.3}",
+        time_to_completion.as_secs_f64() * 1_000.0,
+    );
+}
+
 fn thinking_mode_from_args(args: &mut Vec<String>) -> Result<ThinkingMode> {
     let thinking = take_flag(args, "--thinking");
     let direct = take_flag(args, "--no-thinking");
@@ -271,11 +407,16 @@ fn print_help() {
     println!(
         "teamy-llm prompt [--stop-after <span-or-message>] [--stop-after-duration <duration>] [--model <name>|--model-dir <path>] [--system-prompt <text>] [--thinking|--no-thinking] [--max-new-tokens <n>] [--timeout-ms <ms>] <prompt>"
     );
+    println!(
+        "teamy-llm benchmark [--model <name>|--model-dir <path>] [--system-prompt <text>] [--thinking|--no-thinking|--both-thinking-modes] [--max-new-tokens <n>] [--timeout-ms <ms>] [prompt]"
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{stop_after_args_from, thinking_mode_from_args};
+    use super::{
+        benchmark_thinking_modes_from_args, stop_after_args_from, thinking_mode_from_args,
+    };
     use std::time::Duration;
     use teamy_llm_core::ThinkingMode;
 
@@ -319,5 +460,21 @@ mod tests {
             ThinkingMode::Thinking
         );
         assert_eq!(thinking_args, vec!["prompt"]);
+    }
+
+    #[test]
+    fn benchmark_defaults_to_both_modes_and_can_select_one() {
+        let mut default_args = Vec::new();
+        assert_eq!(
+            benchmark_thinking_modes_from_args(&mut default_args).expect("default modes"),
+            vec![ThinkingMode::Direct, ThinkingMode::Thinking]
+        );
+
+        let mut thinking_args = vec!["--thinking".to_owned()];
+        assert_eq!(
+            benchmark_thinking_modes_from_args(&mut thinking_args).expect("thinking mode"),
+            vec![ThinkingMode::Thinking]
+        );
+        assert!(thinking_args.is_empty());
     }
 }
