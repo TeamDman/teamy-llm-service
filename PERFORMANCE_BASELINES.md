@@ -11,6 +11,8 @@ row for every completed benchmark run; do not overwrite earlier measurements.
 | 2026-07-14T00:01:53-04:00 | thinking | 42.133 | 89.392 | 4.232 | Release build, process-cold, `Why is the sky blue?`, 200-token cap. CUDA lm-head argmax experiment based on `2e4b4cb`; token oracle matched but the implementation was reverted after this regression. Timestamp logged shortly after the run. |
 | 2026-07-18T12:54:52-04:00 | direct | 29.873 | 62.770 | 6.079 | Release build, process-cold, `Why is the sky blue?`, 200-token cap (ended at cap), model `qwopus-3.5-9b-coder-q4-k-m`. CUDA-resident hidden-state bridge working tree based on `71faafd`; 16-token CUDA oracle matched before this run. |
 | 2026-07-18T12:54:52-04:00 | thinking | 29.672 | 63.826 | 5.856 | Release build, process-cold, `Why is the sky blue?`, 200-token cap (ended at cap), model `qwopus-3.5-9b-coder-q4-k-m`. CUDA-resident hidden-state bridge working tree based on `71faafd`; 16-token CUDA oracle matched before this run. |
+| 2026-07-18T13:32:35-04:00 | direct | 29.100 | 55.854 | 7.475 | Release build, process-cold, `Why is the sky blue?`, 200-token cap (ended at cap), model `qwopus-3.5-9b-coder-q4-k-m`. Fused linear-attention input-projection working tree based on `9e7f017`; 16-token CUDA oracle matched before this run. |
+| 2026-07-18T13:32:35-04:00 | thinking | 36.257 | 62.829 | 7.527 | Release build, process-cold, `Why is the sky blue?`, 200-token cap (ended at cap), model `qwopus-3.5-9b-coder-q4-k-m`. Fused linear-attention input-projection working tree based on `9e7f017`; 16-token CUDA oracle matched before this run. |
 
 ## Measurement conventions
 

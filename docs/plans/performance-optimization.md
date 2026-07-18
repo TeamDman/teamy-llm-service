@@ -24,9 +24,9 @@ then append comparable release measurements to `PERFORMANCE_BASELINES.md` for la
 
 ## Scope
 
-**In scope for the current iteration:** completed CUDA-resident hidden-state bridge. The next code
-change is intentionally not selected until a fresh profile of the accepted implementation closes a
-new decision gate.
+**In scope for the current iteration:** completed fused linear-attention input projections. The
+next code change is intentionally unselected until a fresh caller-attributed profile of this
+accepted implementation closes the next decision gate.
 
 **Out of scope for the current iteration:** changing the model, quantization, prompt contract, Vox
 API, CUDA-version policy, concurrency model, or planning subsequent optimization ideas. No CPU
@@ -358,11 +358,99 @@ completion, 6.079 tok/s** and thinking **29.672 s TTFT, 63.826 s completion, 5.8
 Direct exceeded the >= 6.0 tok/s prediction and is 26.4% above its 4.811 tok/s baseline;
 thinking is 21.9% above its 4.804 tok/s baseline.
 
+## Iteration 3 — fused linear-attention input projections
+
+### [x] 7.1 Profile the accepted CUDA-hidden decoder
+
+**Work:**
+
+- Build the accepted source with `--features tracy`, capture the standard 64-token direct run on
+  loopback, and export untruncated caller-attributed rows with `teamy-profiler`.
+- Compare the remaining host-transfer families with item 5.1. Do not append feature-enabled timing
+  to `PERFORMANCE_BASELINES.md`.
+
+**Completion criteria:** The profile either identifies a next bounded production slice or shows
+that GPU-kernel profiling is required before one can be selected.
+
+**Completion notes:** `cargo test -p teamy_llm_burn_qwen35 --features tracy` passed (24 passed,
+1 intentionally ignored) on 2026-07-18. Capture
+`C:\Users\Teamy\Documents\Codex\2026-07-13\that\teamy-llm-profile\direct-64-post-bridge_2026-07-18_13-10-26.tracy`
+was recorded using the same direct 64-token command and bounded localhost-only capture as item
+5.1. Its diagnostic result was 33.210 s TTFT, 45.242 s total, and 5.319 tok/s; it is not a
+normal-release baseline. The prior MLP extraction is absent. The largest remaining attributed
+host transfer is linear-attention `in_proj_qkv` at line 1393: 3.066 s across 1,536 calls (24
+linear layers x 64 steps). Its companion linear projections are `in_proj_b` at line 1436 (1.291
+s), `in_proj_z` at line 1431 (0.883 s), and `in_proj_a` at line 1444 (0.423 s), all also 1,536
+calls. The host lm-head span remains 4.715 s, but the CUDA argmax alternative was already rejected
+with a real-release regression in iteration 1.
+
+### [x] 7.2 Close the fused-projection decision gate
+
+**Work:**
+
+- Select one implementation slice, correctness gate, and measurable prediction from item 7.1.
+- Reject any candidate that merely transfers an equally sized host buffer at the next boundary or
+  requires a broad recurrent-state rewrite.
+
+**Completion criteria:** The next change is bounded, preserves the GPU-only policy, and has a
+stated acceptance threshold before source changes begin.
+
+**Completion notes:** Selected slice: concatenate the four compatible linear-attention projection
+weights along their output-row dimension once per layer, cache that fused CUDA tensor, execute one
+`linear_forward_3d`, extract its concatenated output once, and split it into the existing `qkv`,
+`z`, `b`, and `a` host values. The projection outputs have the same input width and are consumed
+only by the existing host linear-attention state; this preserves that state and eliminates three
+GPU-to-host synchronization/extraction boundaries and three small matrix launches per linear
+layer/token without changing the number of output values. The original 16-token direct oracle
+remains the correctness gate. Because bytes still cross the same host boundary, the conservative
+direct target is **>= 6.35 tok/s** (about 4.5% above the 6.079 tok/s accepted measurement), not a
+transfer-volume-based claim.
+
+### [x] 8.1 Implement and validate fused input projections
+
+**Work:**
+
+- Add a lazy per-layer fused-projection CUDA cache and use it in the default hybrid
+  linear-attention path; release the four superseded cached projection tensors after fusion so the
+  change does not retain duplicate GPU weights.
+- Split the single extracted result with manifest-derived widths and preserve the existing conv
+  history, recurrence, token streaming, cancellation, and direct/thinking contract.
+- Add CPU-backend projection-output parity coverage and verify the real CUDA 16-token oracle
+  before taking normal-release benchmarks.
+
+**Validation:**
+
+```pwsh
+cargo fmt --all -- --check
+cargo test -p teamy_llm_burn_qwen35
+cargo test -p teamy_llm_cli
+```
+
+**Completion criteria:** The hybrid linear path performs one fused projection/extraction instead
+of four separate input projection/extraction pairs, preserves the oracle, and has comparable
+direct and thinking measurements appended to the baseline log.
+
+**Completion notes:** `Qwen35TextRuntime` now lazily concatenates the four compatible
+linear-attention input weights along output rows into a per-layer CUDA cache. All three
+linear-attention paths (prefill, stateful prefill, and default tensor-hidden single-token decode)
+call one `linear_forward_3d`, extract the result once, and de-interleave each token's `qkv`, `z`,
+`beta`, and `a` spans for the existing host recurrence. The cache removes the superseded four
+device tensors after fusion, avoiding duplicate retained GPU weights. A two-token CPU parity test
+verifies both row concatenation and sequence-aware de-interleaving. `cargo fmt --all -- --check`,
+`cargo test -p teamy_llm_burn_qwen35` (25 passed, 1 intentionally ignored),
+`cargo test -p teamy_llm_cli` (3 passed), and `cargo clippy -p teamy_llm_cli -- -D warnings` all
+passed on 2026-07-18. The real CUDA direct no-system-prompt 16-token oracle again matched exactly:
+`[760, 12515, 7701, 6105, 15048, 4016, 310, 264, 24057, 2512, 2972, 28232, 60845, 69377, 159034,
+271]`. The append-only process-cold release rows record direct
+**29.100 s TTFT, 55.854 s completion, 7.475 tok/s** and thinking **36.257 s TTFT, 62.829 s
+completion, 7.527 tok/s**. Direct exceeds the >= 6.35 tok/s prediction and improves 23.0% over
+the prior accepted 6.079 tok/s direct measurement; thinking improves 28.5% over 5.856 tok/s.
+
 ## Next safe action
 
 Capture a fresh caller-attributed profile of this accepted implementation before selecting any
-further production change. Compare its remaining host transfers and hybrid self time with item
-5.1, then add only the next decision-gate and implementation slice supported by that capture.
+further production change. Compare the remaining hybrid self time, lm-head work, and host
+linear-attention state with item 7.1; choose only a new slice supported by that capture.
 
 ## Overall completion criteria for an iteration
 

@@ -405,6 +405,14 @@ struct LoadedTensor {
     values: Vec<f32>,
 }
 
+#[derive(Debug)]
+struct LinearAttentionProjectionValues {
+    mixed_qkv: Vec<f32>,
+    z: Vec<f32>,
+    beta: Vec<f32>,
+    a: Vec<f32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TokenMixerKind {
     FullAttention,
@@ -448,6 +456,7 @@ struct Qwen35TextRuntime<B: Backend> {
     tensor_1d_cache: Mutex<HashMap<String, Tensor<B, 1>>>,
     tensor_1d_values_cache: Mutex<HashMap<String, Vec<f32>>>,
     tensor_2d_cache: Mutex<HashMap<String, Tensor<B, 2>>>,
+    fused_linear_attention_projection_cache: Mutex<HashMap<String, Tensor<B, 2>>>,
     lm_head_tensor_disabled: AtomicBool,
 }
 
@@ -537,6 +546,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             tensor_1d_cache: Mutex::new(HashMap::new()),
             tensor_1d_values_cache: Mutex::new(HashMap::new()),
             tensor_2d_cache: Mutex::new(HashMap::new()),
+            fused_linear_attention_projection_cache: Mutex::new(HashMap::new()),
             lm_head_tensor_disabled: AtomicBool::new(false),
         })
     }
@@ -844,6 +854,91 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             .map_err(|_| eyre::eyre!("2D tensor cache mutex was poisoned"))?
             .insert(tensor_name.to_owned(), tensor.clone());
         Ok(tensor)
+    }
+
+    fn load_fused_linear_attention_projection(&self, prefix: &str) -> eyre::Result<Tensor<B, 2>> {
+        if let Some(cached) = self
+            .fused_linear_attention_projection_cache
+            .lock()
+            .map_err(|_| eyre::eyre!("fused linear-attention projection cache mutex was poisoned"))?
+            .get(prefix)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+
+        let qkv_name = format!("{prefix}.linear_attn.in_proj_qkv.weight");
+        let z_name = format!("{prefix}.linear_attn.in_proj_z.weight");
+        let beta_name = format!("{prefix}.linear_attn.in_proj_b.weight");
+        let a_name = format!("{prefix}.linear_attn.in_proj_a.weight");
+        let fused = fuse_linear_attention_projection_weights(vec![
+            self.load_tensor_2d(&qkv_name)?,
+            self.load_tensor_2d(&z_name)?,
+            self.load_tensor_2d(&beta_name)?,
+            self.load_tensor_2d(&a_name)?,
+        ]);
+
+        // The fused tensor replaces these four device tensors for every production and diagnostic
+        // linear-attention path. Drop their cache references so this optimization doesn't retain
+        // a second full copy of the same weights on the GPU.
+        let mut tensor_cache = self
+            .tensor_2d_cache
+            .lock()
+            .map_err(|_| eyre::eyre!("2D tensor cache mutex was poisoned"))?;
+        tensor_cache.remove(&qkv_name);
+        tensor_cache.remove(&z_name);
+        tensor_cache.remove(&beta_name);
+        tensor_cache.remove(&a_name);
+        drop(tensor_cache);
+
+        let mut fused_cache = self
+            .fused_linear_attention_projection_cache
+            .lock()
+            .map_err(|_| {
+                eyre::eyre!("fused linear-attention projection cache mutex was poisoned")
+            })?;
+        Ok(fused_cache
+            .entry(prefix.to_owned())
+            .or_insert_with(|| fused.clone())
+            .clone())
+    }
+
+    fn linear_attention_projection_values(
+        &self,
+        prefix: &str,
+        hidden_states: &Tensor<B, 3>,
+    ) -> eyre::Result<LinearAttentionProjectionValues> {
+        let key_dim = self
+            .manifest
+            .linear_num_key_heads
+            .checked_mul(self.manifest.linear_key_head_dim)
+            .ok_or_else(|| eyre::eyre!("linear-attention key-dim overflow"))?;
+        let value_dim = self
+            .manifest
+            .linear_num_value_heads
+            .checked_mul(self.manifest.linear_value_head_dim)
+            .ok_or_else(|| eyre::eyre!("linear-attention value-dim overflow"))?;
+        let mixed_qkv_len = key_dim
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(value_dim))
+            .ok_or_else(|| eyre::eyre!("linear-attention qkv projection width overflow"))?;
+        let scalar_projection_len = self.manifest.linear_num_value_heads;
+        let [batch_size, seq_len, _] = hidden_states.dims();
+        let token_count = batch_size
+            .checked_mul(seq_len)
+            .ok_or_else(|| eyre::eyre!("linear-attention projection token count overflow"))?;
+        let values = tensor_to_vec_f32(&linear_forward_3d(
+            hidden_states,
+            self.load_fused_linear_attention_projection(prefix)?,
+            None,
+        ))?;
+        split_fused_linear_attention_projection_values(
+            values,
+            token_count,
+            mixed_qkv_len,
+            value_dim,
+            scalar_projection_len,
+        )
     }
 
     #[allow(dead_code)]
@@ -1385,12 +1480,8 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         hidden_states: Tensor<B, 3>,
         decode_state: &mut LinearAttentionDecodeState,
     ) -> eyre::Result<Tensor<B, 3>> {
-        let mixed_qkv = linear_forward_3d(
-            &hidden_states,
-            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_qkv.weight"))?,
-            None,
-        );
-        let mixed_qkv_values = tensor_to_vec_f32(&mixed_qkv)?;
+        let projection_values = self.linear_attention_projection_values(prefix, &hidden_states)?;
+        let mixed_qkv_values = projection_values.mixed_qkv;
         let conv_weight = self.load_tensor(&format!("{prefix}.linear_attn.conv1d.weight"))?;
         let conv_mixed_qkv = depthwise_causal_conv1d_silu_step(
             &mixed_qkv_values,
@@ -1428,24 +1519,13 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         let mut key = conv_mixed_qkv[key_dim..key_dim * 2].to_vec();
         let value = conv_mixed_qkv[key_dim * 2..].to_vec();
 
-        let z = tensor_to_vec_f32(&linear_forward_3d(
-            &hidden_states,
-            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_z.weight"))?,
-            None,
-        ))?;
-        let beta = tensor_to_vec_f32(&linear_forward_3d(
-            &hidden_states,
-            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_b.weight"))?,
-            None,
-        ))?
-        .into_iter()
-        .map(sigmoid_scalar)
-        .collect::<Vec<_>>();
-        let a = tensor_to_vec_f32(&linear_forward_3d(
-            &hidden_states,
-            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_a.weight"))?,
-            None,
-        ))?;
+        let z = projection_values.z;
+        let beta = projection_values
+            .beta
+            .into_iter()
+            .map(sigmoid_scalar)
+            .collect::<Vec<_>>();
+        let a = projection_values.a;
         let dt_bias = self.load_tensor_1d_values(&format!("{prefix}.linear_attn.dt_bias"))?;
         let a_log = self.load_tensor_1d_values(&format!("{prefix}.linear_attn.A_log"))?;
         let mut g = Vec::with_capacity(a.len());
@@ -2030,12 +2110,8 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             batch_size == 1,
             "Qwen3.5 linear attention currently expects batch size 1"
         );
-        let mixed_qkv = linear_forward_3d(
-            &hidden_states,
-            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_qkv.weight"))?,
-            None,
-        );
-        let mixed_qkv_values = tensor_to_vec_f32(&mixed_qkv)?;
+        let projection_values = self.linear_attention_projection_values(prefix, &hidden_states)?;
+        let mixed_qkv_values = projection_values.mixed_qkv;
         let conv_weight = self.load_tensor(&format!("{prefix}.linear_attn.conv1d.weight"))?;
         let conv_mixed_qkv = depthwise_causal_conv1d_silu(
             &mixed_qkv_values,
@@ -2071,24 +2147,13 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             value.extend_from_slice(&chunk[key_dim * 2..]);
         }
 
-        let z = tensor_to_vec_f32(&linear_forward_3d(
-            &hidden_states,
-            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_z.weight"))?,
-            None,
-        ))?;
-        let beta = tensor_to_vec_f32(&linear_forward_3d(
-            &hidden_states,
-            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_b.weight"))?,
-            None,
-        ))?
-        .into_iter()
-        .map(sigmoid_scalar)
-        .collect::<Vec<_>>();
-        let a = tensor_to_vec_f32(&linear_forward_3d(
-            &hidden_states,
-            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_a.weight"))?,
-            None,
-        ))?;
+        let z = projection_values.z;
+        let beta = projection_values
+            .beta
+            .into_iter()
+            .map(sigmoid_scalar)
+            .collect::<Vec<_>>();
+        let a = projection_values.a;
         let dt_bias =
             tensor_to_vec_f32(&self.load_tensor_1d(&format!("{prefix}.linear_attn.dt_bias"))?)?;
         let a_log =
@@ -2170,12 +2235,8 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             batch_size == 1,
             "Qwen3.5 linear attention currently expects batch size 1"
         );
-        let mixed_qkv = linear_forward_3d(
-            &hidden_states,
-            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_qkv.weight"))?,
-            None,
-        );
-        let mixed_qkv_values = tensor_to_vec_f32(&mixed_qkv)?;
+        let projection_values = self.linear_attention_projection_values(prefix, &hidden_states)?;
+        let mixed_qkv_values = projection_values.mixed_qkv;
         let conv_weight = self.load_tensor(&format!("{prefix}.linear_attn.conv1d.weight"))?;
         let conv_mixed_qkv = depthwise_causal_conv1d_silu(
             &mixed_qkv_values,
@@ -2211,24 +2272,13 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             value.extend_from_slice(&chunk[key_dim * 2..]);
         }
 
-        let z = tensor_to_vec_f32(&linear_forward_3d(
-            &hidden_states,
-            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_z.weight"))?,
-            None,
-        ))?;
-        let beta = tensor_to_vec_f32(&linear_forward_3d(
-            &hidden_states,
-            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_b.weight"))?,
-            None,
-        ))?
-        .into_iter()
-        .map(sigmoid_scalar)
-        .collect::<Vec<_>>();
-        let a = tensor_to_vec_f32(&linear_forward_3d(
-            &hidden_states,
-            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_a.weight"))?,
-            None,
-        ))?;
+        let z = projection_values.z;
+        let beta = projection_values
+            .beta
+            .into_iter()
+            .map(sigmoid_scalar)
+            .collect::<Vec<_>>();
+        let a = projection_values.a;
         let dt_bias =
             tensor_to_vec_f32(&self.load_tensor_1d(&format!("{prefix}.linear_attn.dt_bias"))?)?;
         let a_log =
@@ -4644,6 +4694,54 @@ fn tensor_2d_from_bytes<B: Backend>(
     }
 }
 
+fn fuse_linear_attention_projection_weights<B: Backend>(
+    weights: Vec<Tensor<B, 2>>,
+) -> Tensor<B, 2> {
+    Tensor::cat(weights, 0)
+}
+
+fn split_fused_linear_attention_projection_values(
+    values: Vec<f32>,
+    token_count: usize,
+    mixed_qkv_len: usize,
+    z_len: usize,
+    scalar_projection_len: usize,
+) -> eyre::Result<LinearAttentionProjectionValues> {
+    let projection_width = mixed_qkv_len
+        .checked_add(z_len)
+        .and_then(|value| value.checked_add(scalar_projection_len))
+        .and_then(|value| value.checked_add(scalar_projection_len))
+        .ok_or_else(|| eyre::eyre!("fused linear-attention projection width overflow"))?;
+    let expected_len = token_count
+        .checked_mul(projection_width)
+        .ok_or_else(|| eyre::eyre!("fused linear-attention projection value count overflow"))?;
+    ensure!(
+        values.len() == expected_len,
+        "Fused linear-attention projection expected {expected_len} values but found {}",
+        values.len()
+    );
+
+    let mut mixed_qkv = Vec::with_capacity(token_count * mixed_qkv_len);
+    let mut z = Vec::with_capacity(token_count * z_len);
+    let mut beta = Vec::with_capacity(token_count * scalar_projection_len);
+    let mut a = Vec::with_capacity(token_count * scalar_projection_len);
+    for row in values.chunks_exact(projection_width) {
+        let z_start = mixed_qkv_len;
+        let beta_start = z_start + z_len;
+        let a_start = beta_start + scalar_projection_len;
+        mixed_qkv.extend_from_slice(&row[..z_start]);
+        z.extend_from_slice(&row[z_start..beta_start]);
+        beta.extend_from_slice(&row[beta_start..a_start]);
+        a.extend_from_slice(&row[a_start..]);
+    }
+    Ok(LinearAttentionProjectionValues {
+        mixed_qkv,
+        z,
+        beta,
+        a,
+    })
+}
+
 fn linear_forward_3d<B: Backend>(
     input: &Tensor<B, 3>,
     weight: Tensor<B, 2>,
@@ -5782,16 +5880,18 @@ mod tests {
         SOURCE_SAFETENSORS_INDEX_FILE_NAME, apply_rotary_slice, bytes_per_element, causal_mask,
         check_generation_cancellation, cuda_runtime_version_is_compatible, decode_bytes_into_f32,
         dot_product, export_burn_text_weights, f16_bits_to_f32, first_mismatch_index,
-        inspect_burn_text_runtime_status, is_generation_cancelled_error, parse_nvidia_driver_major,
+        fuse_linear_attention_projection_weights, inspect_burn_text_runtime_status,
+        is_generation_cancelled_error, linear_forward_3d, parse_nvidia_driver_major,
         parse_nvidia_smi_cuda_version, qwen_rms_norm, qwen_rms_norm_tensor, rotary_embeddings,
-        sigmoid_scalar, softmax_scalars, softmax_scalars_in_place, verify_required_cuda_runtime,
+        sigmoid_scalar, softmax_scalars, softmax_scalars_in_place,
+        split_fused_linear_attention_projection_values, verify_required_cuda_runtime,
         verify_required_cuda_runtime_in,
     };
     use crate::model::{
         DEFAULT_LLM_MODEL_NAME, HF_CONFIG_FILE_NAME, MODEL_FILE_NAME, TOKENIZER_CONFIG_FILE_NAME,
         TOKENIZER_FILE_NAME, inspect_model_dir,
     };
-    use burn::tensor::Tensor;
+    use burn::tensor::{Tensor, TensorData};
     use safetensors::{Dtype, serialize_to_file, tensor::TensorView};
     use std::collections::BTreeMap;
     use tokenizers::{Tokenizer, models::bpe::BPE};
@@ -5974,6 +6074,57 @@ mod tests {
         for (actual, expected) in actual.iter().zip(expected.iter()) {
             assert!((actual - expected).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn fused_linear_attention_projection_matches_individual_outputs() {
+        let device = Default::default();
+        let input = Tensor::<LlmCpuBackend, 3>::from_data(
+            TensorData::new(vec![1.0_f32, -2.0, 0.5, 3.0], [1, 2, 2]),
+            &device,
+        );
+        let qkv = Tensor::<LlmCpuBackend, 2>::from_data(
+            TensorData::new(vec![1.0_f32, 0.0, 0.0, 1.0, 2.0, -1.0], [3, 2]),
+            &device,
+        );
+        let z = Tensor::<LlmCpuBackend, 2>::from_data(
+            TensorData::new(vec![-1.0_f32, 1.0, 0.5, 0.5], [2, 2]),
+            &device,
+        );
+        let beta = Tensor::<LlmCpuBackend, 2>::from_data(
+            TensorData::new(vec![3.0_f32, 1.0], [1, 2]),
+            &device,
+        );
+        let a = Tensor::<LlmCpuBackend, 2>::from_data(
+            TensorData::new(vec![2.0_f32, 2.0], [1, 2]),
+            &device,
+        );
+        let expected = [qkv.clone(), z.clone(), beta.clone(), a.clone()]
+            .into_iter()
+            .flat_map(|weight| {
+                linear_forward_3d(&input, weight, None)
+                    .to_data()
+                    .to_vec::<f32>()
+                    .expect("individual projection data")
+            })
+            .collect::<Vec<_>>();
+        let actual_values = linear_forward_3d(
+            &input,
+            fuse_linear_attention_projection_weights(vec![qkv, z, beta, a]),
+            None,
+        )
+        .to_data()
+        .to_vec::<f32>()
+        .expect("fused projection data");
+        let actual_values =
+            split_fused_linear_attention_projection_values(actual_values, 2, 3, 2, 1)
+                .expect("split fused projection data");
+        let mut actual = actual_values.mixed_qkv;
+        actual.extend(actual_values.z);
+        actual.extend(actual_values.beta);
+        actual.extend(actual_values.a);
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
