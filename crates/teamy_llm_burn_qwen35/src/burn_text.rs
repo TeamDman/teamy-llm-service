@@ -2531,17 +2531,50 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         Ok(best_index)
     }
 
+    fn greedy_next_token_from_hidden_state_tensor(
+        &self,
+        hidden: Tensor<B, 3>,
+    ) -> eyre::Result<usize> {
+        llm_tracy_zone!("llm_burn_lm_head_scan");
+        #[cfg(feature = "extended_observability")]
+        let _span = tracing::debug_span!(
+            "llm_burn_lm_head_scan",
+            hidden_size = hidden.dims()[2],
+            device_hidden = true
+        )
+        .entered();
+        if !self.lm_head_tensor_disabled.load(Ordering::Relaxed) {
+            match self.greedy_next_token_from_hidden_device_tensor(hidden.clone()) {
+                Ok(token_id) => return Ok(token_id),
+                Err(error) => {
+                    self.lm_head_tensor_disabled.store(true, Ordering::Relaxed);
+                    trace_burn_text_runtime(&format!(
+                        "device lm_head path unavailable; falling back to row scan: {error}"
+                    ));
+                }
+            }
+        }
+        self.greedy_next_token(hidden)
+    }
+
     fn greedy_next_token_from_hidden_tensor(&self, hidden: &[f32]) -> eyre::Result<usize> {
+        self.greedy_next_token_from_hidden_device_tensor(tensor_3d(
+            [1, 1, hidden.len()],
+            hidden.to_vec(),
+            &self.device,
+        ))
+    }
+
+    fn greedy_next_token_from_hidden_device_tensor(
+        &self,
+        hidden: Tensor<B, 3>,
+    ) -> eyre::Result<usize> {
         let lm_head_name = if self.manifest.tensors.contains_key("lm_head.weight") {
             "lm_head.weight"
         } else {
             "model.embed_tokens.weight"
         };
-        let logits = linear_forward_3d(
-            &tensor_3d([1, 1, hidden.len()], hidden.to_vec(), &self.device),
-            self.load_tensor_2d(lm_head_name)?,
-            None,
-        );
+        let logits = linear_forward_3d(&hidden, self.load_tensor_2d(lm_head_name)?, None);
         let logits = tensor_to_vec_f32(&logits)?;
         let (best_token_id, _) = logits
             .into_iter()
@@ -4329,7 +4362,7 @@ fn generate_with_hybrid_burn_text_runtime_with_runtime<B: Backend>(
             token_index + 1,
             decode_state.processed_token_count
         ));
-        let next_token_id = runtime.greedy_next_token(last_hidden.clone())?;
+        let next_token_id = runtime.greedy_next_token_from_hidden_state_tensor(last_hidden)?;
         trace_burn_text_runtime(&format!("hybrid selected token id {next_token_id}"));
         generated_token_ids.push(next_token_id);
         emit_generated_token(

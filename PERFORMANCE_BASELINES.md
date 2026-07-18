@@ -13,6 +13,8 @@ row for every completed benchmark run; do not overwrite earlier measurements.
 | 2026-07-18T12:54:52-04:00 | thinking | 29.672 | 63.826 | 5.856 | Release build, process-cold, `Why is the sky blue?`, 200-token cap (ended at cap), model `qwopus-3.5-9b-coder-q4-k-m`. CUDA-resident hidden-state bridge working tree based on `71faafd`; 16-token CUDA oracle matched before this run. |
 | 2026-07-18T13:32:35-04:00 | direct | 29.100 | 55.854 | 7.475 | Release build, process-cold, `Why is the sky blue?`, 200-token cap (ended at cap), model `qwopus-3.5-9b-coder-q4-k-m`. Fused linear-attention input-projection working tree based on `9e7f017`; 16-token CUDA oracle matched before this run. |
 | 2026-07-18T13:32:35-04:00 | thinking | 36.257 | 62.829 | 7.527 | Release build, process-cold, `Why is the sky blue?`, 200-token cap (ended at cap), model `qwopus-3.5-9b-coder-q4-k-m`. Fused linear-attention input-projection working tree based on `9e7f017`; 16-token CUDA oracle matched before this run. |
+| 2026-07-18T15:25:44-04:00 | direct | 36.437 | 62.653 | 7.629 | Release build, process-cold, `Why is the sky blue?`, 200-token cap (ended at cap), model `qwopus-3.5-9b-coder-q4-k-m`. Device-hidden lm-head handoff working tree based on `9161878`; 16-token CUDA oracle matched before this run. Timestamp logged after the paired runs. |
+| 2026-07-18T15:25:44-04:00 | thinking | 27.405 | 53.126 | 7.776 | Release build, process-cold, `Why is the sky blue?`, 200-token cap (ended at cap), model `qwopus-3.5-9b-coder-q4-k-m`. Device-hidden lm-head handoff working tree based on `9161878`; 16-token CUDA oracle matched before this run. Timestamp logged after the paired runs. |
 
 ## Measurement conventions
 

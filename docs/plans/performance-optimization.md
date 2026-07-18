@@ -446,11 +446,96 @@ passed on 2026-07-18. The real CUDA direct no-system-prompt 16-token oracle agai
 completion, 7.527 tok/s**. Direct exceeds the >= 6.35 tok/s prediction and improves 23.0% over
 the prior accepted 6.079 tok/s direct measurement; thinking improves 28.5% over 5.856 tok/s.
 
+## Iteration 4 — eliminate the generated-token hidden-state lm-head round trip
+
+### [x] 9.1 Profile the accepted fused-projection decoder
+
+**Work:**
+
+- Build the accepted source with `--features tracy`, capture the standard 64-token direct run on
+  loopback, and export caller-attributed rows with `teamy-profiler`.
+- Compare the remaining host-transfer families with item 7.1. Do not append feature-enabled timing
+  to `PERFORMANCE_BASELINES.md`.
+
+**Completion criteria:** The profile identifies whether a bounded transfer or host-work slice
+remains after fused projections, without treating Tracy CPU-zone time as GPU timing.
+
+**Completion notes:** `cargo test -p teamy_llm_burn_qwen35 --features tracy` passed (25 passed,
+1 intentionally ignored) on 2026-07-18. Capture
+`C:\Users\Teamy\Documents\Codex\2026-07-13\that\teamy-llm-profile\direct-64-post-fused_2026-07-18_15-12-07.tracy`
+recorded the usual loopback direct 64-token run; its diagnostic result was 29.406 s TTFT,
+37.692 s completion, and 7.724 tok/s, and is not a normal-release baseline. The fused-projection
+extractions are gone as separate callers. The largest remaining attributed transfer family is now
+the single fused linear-attention extraction at line 930 (4.156 s across 1,560 calls), which is
+coupled to the current host recurrent state and therefore requires a broader rewrite. The host
+lm-head span remains 3.196 s across 64 calls; the full logits extraction at line 2545 accounts
+for 1.112 s. The previously tested CUDA argmax alternative remains rejected because it regressed
+normal-release throughput.
+
+### [x] 9.2 Close the device-hidden lm-head decision gate
+
+**Work:**
+
+- Select one small production slice and state its token-oracle gate and measurable prediction.
+- Preserve the existing logits host scan and its failure behavior; do not retry the rejected CUDA
+  argmax experiment or start a recurrent-state rewrite in this iteration.
+
+**Completion criteria:** The selected change removes a real boundary in the default path without
+changing the token-selection policy or expanding into the host linear-attention state.
+
+**Completion notes:** Selected slice: for generated tokens after prefill, pass the existing
+`[1, 1, hidden]` CUDA tensor directly to the lm-head projection rather than first downloading the
+hidden state and immediately uploading it again. The logits will still be downloaded and scanned
+on the host exactly as today, and the prefill path remains unchanged. On device lm-head failure,
+the existing disabled flag and host selection path will remain available. The 16-token direct CUDA
+oracle remains the correctness gate. This removes a small synchronized hidden-state round trip
+rather than a large transfer, so the conservative direct target is **>= 7.60 tok/s** (about 1.7%
+above the accepted 7.475 tok/s result).
+
+### [x] 10.1 Implement and validate the device-hidden lm-head handoff
+
+**Work:**
+
+- Add a direct tensor-hidden lm-head selection entry point for the default post-prefill hybrid
+  loop, sharing the exact host logits scan with the current tensor lm-head path.
+- Retain the existing host fallback when device lm-head execution has been disabled or fails.
+- Run focused tests, the CUDA oracle, and comparable direct/thinking release benchmarks before
+  accepting or rejecting the prediction.
+
+**Validation:**
+
+```pwsh
+cargo fmt --all -- --check
+cargo test -p teamy_llm_burn_qwen35
+cargo test -p teamy_llm_cli
+```
+
+**Completion criteria:** Generated-token lm-head projection receives the already-resident CUDA
+hidden tensor, token IDs preserve the oracle, and comparable measurements are appended to the
+baseline log.
+
+**Completion notes:** The post-prefill hybrid loop now consumes its existing `[1, 1, hidden]`
+CUDA tensor through `greedy_next_token_from_hidden_state_tensor`. Its CUDA lm-head projection and
+host logits download/max scan are shared with the prior host-hidden tensor path, so token selection
+semantics did not change. The first prefill selection remains unchanged. If the device lm-head path
+is disabled or fails, the new entry point defers to the existing hidden download and host row-scan
+fallback. `cargo fmt --all -- --check`, `cargo test -p teamy_llm_burn_qwen35` (25 passed, 1
+intentionally ignored), `cargo test -p teamy_llm_cli` (3 passed), `cargo clippy -p
+teamy_llm_burn_qwen35 -- -D warnings`, and `cargo clippy -p teamy_llm_cli -- -D warnings` all
+passed on 2026-07-18. The real CUDA direct no-system-prompt 16-token oracle again matched exactly:
+`[760, 12515, 7701, 6105, 15048, 4016, 310, 264, 24057, 2512, 2972, 28232, 60845, 69377, 159034,
+271]`. The append-only process-cold release rows record direct **36.437 s TTFT, 62.653 s
+completion, 7.629 tok/s** and thinking **27.405 s TTFT, 53.126 s completion, 7.776 tok/s**.
+Direct exceeds the >= 7.60 tok/s prediction by 2.1% and improves 2.1% over its 7.475 tok/s
+pre-change measurement; thinking improves 3.3% over 7.527 tok/s. Direct TTFT was higher than the
+previous process-cold sample, so the accepted result is limited to post-first-token throughput and
+does not claim a TTFT improvement.
+
 ## Next safe action
 
-Capture a fresh caller-attributed profile of this accepted implementation before selecting any
-further production change. Compare the remaining hybrid self time, lm-head work, and host
-linear-attention state with item 7.1; choose only a new slice supported by that capture.
+Capture a fresh caller-attributed profile of this accepted handoff before selecting another
+production change. Compare the remaining host linear-attention-state transfer with the lm-head
+span, and choose only one new bounded slice supported by that capture.
 
 ## Overall completion criteria for an iteration
 
