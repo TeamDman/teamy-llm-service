@@ -2,7 +2,7 @@
 
 **Plan status:** Active
 **Primary implementation root:** `G:\Programming\Repos\teamy-llm-service` on `agent/async-model-preparation`
-**Last updated:** 2026-07-13
+**Last updated:** 2026-07-18
 
 ## How to update this plan
 
@@ -24,9 +24,9 @@ then append comparable release measurements to `PERFORMANCE_BASELINES.md` for la
 
 ## Scope
 
-**In scope for the current iteration:** close the rejected CUDA lm-head argmax experiment with its
-profile, correctness, and benchmark evidence. The next code change is intentionally not selected
-until a new profiling decision closes a fresh iteration.
+**In scope for the current iteration:** completed CUDA-resident hidden-state bridge. The next code
+change is intentionally not selected until a fresh profile of the accepted implementation closes a
+new decision gate.
 
 **Out of scope for the current iteration:** changing the model, quantization, prompt contract, Vox
 API, CUDA-version policy, concurrency model, or planning subsequent optimization ideas. No CPU
@@ -254,6 +254,115 @@ implementation.
 regression. The append-only baseline log retains both failed measurements, and this plan retains the
 capture, oracle, target, and rejection rationale. No next implementation slice is preselected; the
 next safe action is a new profile-driven decision.
+
+## Iteration 2 — caller-attributed hybrid-decode profile
+
+### [x] 5.1 Attribute host tensor extraction to its call sites
+
+**Work:**
+
+- Add `#[track_caller]` metadata to the opt-in `llm_burn_tensor_to_vec_f32` Tracy span so the
+  profiler separates same-rank extractions by direct source line.
+- Build with `--features tracy`, capture the existing 64-token direct benchmark on loopback, and
+  summarize the top exclusive CPU zones with `teamy-profiler`.
+- Record the capture path, command, and largest caller-specific rank-3 transfers below. Do not
+  append these feature-enabled measurements to `PERFORMANCE_BASELINES.md`.
+
+**Validation:**
+
+```pwsh
+cargo test -p teamy_llm_burn_qwen35 --features tracy
+G:\Programming\Repos\teamy-profiler\target\release\teamy-profiler.exe tracy csv export <capture.tracy> --top 25 --table
+```
+
+**Completion criteria:** The profile distinguishes the relevant decode call families well enough
+to choose one production slice and a predicted improvement, or it explicitly shows that a GPU
+kernel profiler is required before one can be chosen.
+
+**Completion notes:** `#[track_caller]` now adds source line/column fields only to the existing
+`extended_observability` `llm_burn_tensor_to_vec_f32` span. `cargo fmt --all -- --check` and
+`cargo test -p teamy_llm_burn_qwen35 --features tracy` passed (23 passed, 1 intentionally ignored
+CUDA-contract test) on 2026-07-18. Capture
+`C:\Users\Teamy\Documents\Codex\2026-07-13\that\teamy-llm-profile\direct-64-caller-attributed_2026-07-18_12-34-35.tracy`
+was recorded with the release direct 64-token command and a bounded localhost-only `tracy-capture`
+run. Its diagnostic result was 26.802 s TTFT, 39.593 s total, and 5.004 tok/s; it is not appended
+to the non-Tracy baseline log. The untruncated `teamy-profiler` export identified line 1150
+(`forward_mlp_single` down projection) as the largest rank-3 extraction: 3.373 s across 2,048
+calls (32 layers x 64 decode steps). Other repeated linear-attention transfers were line 1347
+(1.099 s), 1355 (0.998 s), 1419 (0.984 s), 1304 (0.967 s), and 1342 (0.878 s), each 1,536 calls.
+The existing host lm-head scan remained 2.931 s but is not retried after the rejected CUDA-argmax
+experiment.
+
+### [x] 5.2 Close the next decision gate
+
+**Work:**
+
+- Use item 5.1 evidence to select exactly one bounded production change, record the affected
+  functions/state, a small token-ID oracle, and a measurable prediction before implementation.
+- If the CPU trace cannot distinguish the dominant work, stop at that conclusion and select an
+  appropriate GPU-kernel profiling method instead of speculating.
+
+**Completion criteria:** The next production change is justified by the capture and has a stated
+acceptance threshold; no implementation tasks are listed before that decision.
+
+**Completion notes:** A MLP-only output change would merely move the same-sized host transfer to
+the next layer because the current single-token decoder accepts and returns `Vec<f32>`. The chosen
+bounded slice is therefore a CUDA-resident hidden-state bridge across the default hybrid
+single-token layer loop: tensor-native RMS norm and residual additions, MLP tensors retained on
+device, and tensor hidden state passed to the next layer. The existing host full/linear attention
+state math, the host lm-head scan, prompt contract, cancellation, caching, and diagnostic paths are
+unchanged. The prior 16-token direct no-system-prompt oracle remains the correctness gate:
+`[760, 12515, 7701, 6105, 15048, 4016, 310, 264, 24057, 2512, 2972, 28232, 60845, 69377, 159034, 271]`.
+The dominant eliminated transfer alone is 3.373 s of the capture's 12.791 s post-first-token time;
+after allowing for added GPU norm/reduction work, the conservative direct acceptance target is
+**>= 6.0 tok/s** (about 25% over the 4.811 tok/s comparable baseline).
+
+### [x] 6.1 Implement and validate the CUDA-resident hidden-state bridge
+
+**Work:**
+
+- Add a tensor-native Qwen RMS norm and use CUDA tensors for hidden residuals and MLP results in
+  the default hybrid single-token layer loop.
+- Keep full/linear attention's existing decode-state arithmetic and the host lm-head scan intact;
+  no generic CPU execution path may be selected for production generation.
+- Add focused CPU-backend helper parity coverage, then verify the real CUDA 16-token token-ID
+  oracle before collecting normal-release benchmark data.
+
+**Validation:**
+
+```pwsh
+cargo fmt --all -- --check
+cargo test -p teamy_llm_burn_qwen35
+cargo test -p teamy_llm_cli
+```
+
+**Completion criteria:** The default hybrid path preserves the oracle and no longer performs the
+line-1150 MLP output extraction for generated tokens. Comparable direct and thinking benchmarks
+will be run only after this implementation item is complete.
+
+**Completion notes:** The default hybrid generation loop now calls
+`forward_token_hidden_tensor`, which retains `[1, 1, hidden]` CUDA tensors across token-decoder
+layers. `forward_decoder_layer_tensor_single` performs its two residual additions and Qwen RMS
+norms on the device, while `forward_mlp` returns its CUDA tensor directly. The existing
+full/linear attention state math and host lm-head scan remain in place; the old `Vec<f32>`
+single-token functions remain diagnostic paths and are not selected for production hybrid
+generation. This removes the prior line-1150 `forward_mlp_single` output extraction from generated
+tokens rather than moving the same transfer to the next layer. The new CPU-backend
+`tensor_rms_norm_matches_host_reference` test passed. `cargo fmt --all -- --check`,
+`cargo test -p teamy_llm_burn_qwen35` (24 passed, 1 intentionally ignored),
+`cargo test -p teamy_llm_cli` (3 passed), and `cargo clippy -p teamy_llm_cli -- -D warnings` all
+passed on 2026-07-18. The real CUDA direct no-system-prompt 16-token oracle matched exactly:
+`[760, 12515, 7701, 6105, 15048, 4016, 310, 264, 24057, 2512, 2972, 28232, 60845, 69377, 159034, 271]`.
+The append-only release, process-cold 200-token rows record direct **29.873 s TTFT, 62.770 s
+completion, 6.079 tok/s** and thinking **29.672 s TTFT, 63.826 s completion, 5.856 tok/s**.
+Direct exceeded the >= 6.0 tok/s prediction and is 26.4% above its 4.811 tok/s baseline;
+thinking is 21.9% above its 4.804 tok/s baseline.
+
+## Next safe action
+
+Capture a fresh caller-attributed profile of this accepted implementation before selecting any
+further production change. Compare its remaining host transfers and hybrid self time with item
+5.1, then add only the next decision-gate and implementation slice supported by that capture.
 
 ## Overall completion criteria for an iteration
 

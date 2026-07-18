@@ -1129,6 +1129,67 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         add_vectors(&mixed, &mlp)
     }
 
+    fn forward_token_hidden_tensor(
+        &self,
+        decode_state: &mut Qwen35DecodeState,
+        token_id: u32,
+    ) -> eyre::Result<Tensor<B, 3>> {
+        let mut hidden = tensor_3d(
+            [1, 1, self.manifest.hidden_size],
+            self.read_rows_f32("model.embed_tokens.weight", &[token_id])?,
+            &self.device,
+        );
+        for layer_index in 0..self.manifest.num_hidden_layers {
+            GenerationDeadline::check_current()?;
+            hidden = self.forward_decoder_layer_tensor_single(
+                layer_index,
+                hidden,
+                decode_state.processed_token_count,
+                &mut decode_state.layer_states[layer_index],
+            )?;
+        }
+        let norm_weight = self.load_tensor_1d("model.norm.weight")?;
+        let hidden = qwen_rms_norm_tensor(hidden, norm_weight, self.manifest.rms_norm_eps as f32);
+        decode_state.processed_token_count += 1;
+        Ok(hidden)
+    }
+
+    fn forward_decoder_layer_tensor_single(
+        &self,
+        layer_index: usize,
+        hidden: Tensor<B, 3>,
+        position: usize,
+        layer_state: &mut DecoderLayerDecodeState,
+    ) -> eyre::Result<Tensor<B, 3>> {
+        let [batch_size, seq_len, hidden_size] = hidden.dims();
+        ensure!(
+            batch_size == 1 && seq_len == 1 && hidden_size == self.manifest.hidden_size,
+            "Qwen3.5 tensor decode step expected 1x1x{} hidden state, but found {batch_size}x{seq_len}x{hidden_size}",
+            self.manifest.hidden_size,
+        );
+        let prefix = format!("model.layers.{layer_index}");
+        let normalized = qwen_rms_norm_tensor(
+            hidden.clone(),
+            self.load_tensor_1d(&format!("{prefix}.input_layernorm.weight"))?,
+            self.manifest.rms_norm_eps as f32,
+        );
+        let mixed_delta = match layer_state {
+            DecoderLayerDecodeState::Full(full_state) => self
+                .forward_full_attention_tensor_single(&prefix, normalized, position, full_state)?,
+            DecoderLayerDecodeState::Linear(linear_state) => {
+                self.forward_linear_attention_tensor_single(&prefix, normalized, linear_state)?
+            }
+        };
+        let mixed = hidden + mixed_delta;
+        let post_norm = qwen_rms_norm_tensor(
+            mixed.clone(),
+            self.load_tensor_1d(&format!("{prefix}.post_attention_layernorm.weight"))?,
+            self.manifest.rms_norm_eps as f32,
+        );
+        let mlp = self.forward_mlp(&format!("{prefix}.mlp"), post_norm)?;
+        Ok(mixed + mlp)
+    }
+
     #[allow(dead_code)]
     fn forward_mlp_single(&self, prefix: &str, hidden: &[f32]) -> eyre::Result<Vec<f32>> {
         let _activation = self.hidden_activation_kind()?;
@@ -1167,6 +1228,21 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             hidden.to_vec(),
             &self.device,
         );
+        tensor_to_vec_f32(&self.forward_full_attention_tensor_single(
+            prefix,
+            hidden_states,
+            position,
+            decode_state,
+        )?)
+    }
+
+    fn forward_full_attention_tensor_single(
+        &self,
+        prefix: &str,
+        hidden_states: Tensor<B, 3>,
+        position: usize,
+        decode_state: &mut FullAttentionDecodeState,
+    ) -> eyre::Result<Tensor<B, 3>> {
         let head_dim = self.manifest.head_dim;
         let query_projection = linear_forward_3d(
             &hidden_states,
@@ -1277,7 +1353,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             .zip(gate_values)
             .map(|(output, gate)| output * gate)
             .collect::<Vec<_>>();
-        tensor_to_vec_f32(&linear_forward_3d(
+        Ok(linear_forward_3d(
             &tensor_3d([1, 1, self.manifest.hidden_size], gated, &self.device),
             self.load_tensor_2d(&format!("{prefix}.self_attn.o_proj.weight"))?,
             None,
@@ -1296,6 +1372,19 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             hidden.to_vec(),
             &self.device,
         );
+        tensor_to_vec_f32(&self.forward_linear_attention_tensor_single(
+            prefix,
+            hidden_states,
+            decode_state,
+        )?)
+    }
+
+    fn forward_linear_attention_tensor_single(
+        &self,
+        prefix: &str,
+        hidden_states: Tensor<B, 3>,
+        decode_state: &mut LinearAttentionDecodeState,
+    ) -> eyre::Result<Tensor<B, 3>> {
         let mixed_qkv = linear_forward_3d(
             &hidden_states,
             self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_qkv.weight"))?,
@@ -1416,7 +1505,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             self.manifest.rms_norm_eps as f32,
             &z,
         )?;
-        tensor_to_vec_f32(&linear_forward_3d(
+        Ok(linear_forward_3d(
             &tensor_3d([1, 1, value_dim], normalized, &self.device),
             self.load_tensor_2d(&format!("{prefix}.linear_attn.out_proj.weight"))?,
             None,
@@ -4176,7 +4265,7 @@ fn generate_with_hybrid_burn_text_runtime_with_runtime<B: Backend>(
 
     deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
     trace_burn_text_runtime("hybrid handing off first generated token to cached decode state");
-    let mut last_hidden = runtime.forward_token_hidden(
+    let mut last_hidden = runtime.forward_token_hidden_tensor(
         &mut decode_state,
         u32::try_from(first_token_id)
             .wrap_err_with(|| format!("Token id {first_token_id} exceeded u32 range"))?,
@@ -4190,7 +4279,7 @@ fn generate_with_hybrid_burn_text_runtime_with_runtime<B: Backend>(
             token_index + 1,
             decode_state.processed_token_count
         ));
-        let next_token_id = runtime.greedy_next_token_from_hidden(&last_hidden)?;
+        let next_token_id = runtime.greedy_next_token(last_hidden.clone())?;
         trace_burn_text_runtime(&format!("hybrid selected token id {next_token_id}"));
         generated_token_ids.push(next_token_id);
         emit_generated_token(
@@ -4204,7 +4293,7 @@ fn generate_with_hybrid_burn_text_runtime_with_runtime<B: Backend>(
         if eos_token_id.is_some_and(|eos_token_id| eos_token_id == next_token_id) {
             break;
         }
-        last_hidden = runtime.forward_token_hidden(
+        last_hidden = runtime.forward_token_hidden_tensor(
             &mut decode_state,
             u32::try_from(next_token_id)
                 .wrap_err_with(|| format!("Token id {next_token_id} exceeded u32 range"))?,
@@ -4582,10 +4671,20 @@ fn shape_array<const D: usize>(shape: &[usize], tensor_name: &str) -> eyre::Resu
     Ok(out)
 }
 
+#[track_caller]
 fn tensor_to_vec_f32<B: Backend, const D: usize>(tensor: &Tensor<B, D>) -> eyre::Result<Vec<f32>> {
     llm_tracy_zone!("llm_burn_tensor_to_vec_f32");
     #[cfg(feature = "extended_observability")]
-    let _span = tracing::debug_span!("llm_burn_tensor_to_vec_f32", rank = D).entered();
+    let _span = {
+        let caller = std::panic::Location::caller();
+        tracing::debug_span!(
+            "llm_burn_tensor_to_vec_f32",
+            rank = D,
+            caller_line = caller.line(),
+            caller_column = caller.column(),
+        )
+        .entered()
+    };
     tensor
         .to_data()
         .convert::<f32>()
@@ -4836,6 +4935,20 @@ fn qwen_rms_norm(
         }
     }
     Ok(output)
+}
+
+fn qwen_rms_norm_tensor<B: Backend>(
+    values: Tensor<B, 3>,
+    weight: Tensor<B, 1>,
+    eps: f32,
+) -> Tensor<B, 3> {
+    llm_tracy_zone!("llm_burn_qwen_rms_norm_tensor");
+    #[cfg(feature = "extended_observability")]
+    let _span = tracing::debug_span!("llm_burn_qwen_rms_norm_tensor").entered();
+    let hidden_size = values.dims()[2];
+    let variance = values.clone().powf_scalar(2.0).mean_dim(2);
+    let normalized = values * variance.add_scalar(eps).sqrt().recip();
+    normalized * weight.add_scalar(1.0).reshape([1, 1, hidden_size])
 }
 
 fn qwen_rms_norm_no_center(
@@ -5670,13 +5783,15 @@ mod tests {
         check_generation_cancellation, cuda_runtime_version_is_compatible, decode_bytes_into_f32,
         dot_product, export_burn_text_weights, f16_bits_to_f32, first_mismatch_index,
         inspect_burn_text_runtime_status, is_generation_cancelled_error, parse_nvidia_driver_major,
-        parse_nvidia_smi_cuda_version, rotary_embeddings, sigmoid_scalar, softmax_scalars,
-        softmax_scalars_in_place, verify_required_cuda_runtime, verify_required_cuda_runtime_in,
+        parse_nvidia_smi_cuda_version, qwen_rms_norm, qwen_rms_norm_tensor, rotary_embeddings,
+        sigmoid_scalar, softmax_scalars, softmax_scalars_in_place, verify_required_cuda_runtime,
+        verify_required_cuda_runtime_in,
     };
     use crate::model::{
         DEFAULT_LLM_MODEL_NAME, HF_CONFIG_FILE_NAME, MODEL_FILE_NAME, TOKENIZER_CONFIG_FILE_NAME,
         TOKENIZER_FILE_NAME, inspect_model_dir,
     };
+    use burn::tensor::Tensor;
     use safetensors::{Dtype, serialize_to_file, tensor::TensorView};
     use std::collections::BTreeMap;
     use tokenizers::{Tokenizer, models::bpe::BPE};
@@ -5836,6 +5951,28 @@ mod tests {
         softmax_scalars_in_place(&mut actual);
         for (left, right) in expected.iter().zip(actual.iter()) {
             assert!((left - right).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn tensor_rms_norm_matches_host_reference() {
+        let device = Default::default();
+        let values = [[[1.0_f32, -2.0, 0.5, 3.0], [-1.5, 0.25, 2.0, -0.75]]];
+        let expected_values = vec![1.0_f32, -2.0, 0.5, 3.0, -1.5, 0.25, 2.0, -0.75];
+        let weight = [0.1_f32, -0.2, 0.3, 0.4];
+        let expected =
+            qwen_rms_norm(&expected_values, 1, 2, 4, &weight, 1e-6).expect("host RMS norm");
+        let actual = qwen_rms_norm_tensor(
+            Tensor::<LlmCpuBackend, 3>::from_data(values, &device),
+            Tensor::<LlmCpuBackend, 1>::from_data(weight, &device),
+            1e-6,
+        )
+        .to_data()
+        .to_vec::<f32>()
+        .expect("tensor RMS norm data");
+
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert!((actual - expected).abs() < 1e-6);
         }
     }
 

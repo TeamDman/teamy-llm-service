@@ -9,6 +9,8 @@ row for every completed benchmark run; do not overwrite earlier measurements.
 | 2026-07-13T23:08:53-04:00 | thinking | 40.846 | 82.476 | 4.804 | Release build, process-cold, `Why is the sky blue?`, 200-token cap, commit `5605696`. Timestamp recorded when this log was created immediately after the measurement. |
 | 2026-07-14T00:01:53-04:00 | direct | 39.541 | 88.466 | 4.088 | Release build, process-cold, `Why is the sky blue?`, 200-token cap. CUDA lm-head argmax experiment based on `2e4b4cb`; token oracle matched but the implementation was reverted after this regression. Timestamp logged shortly after the run. |
 | 2026-07-14T00:01:53-04:00 | thinking | 42.133 | 89.392 | 4.232 | Release build, process-cold, `Why is the sky blue?`, 200-token cap. CUDA lm-head argmax experiment based on `2e4b4cb`; token oracle matched but the implementation was reverted after this regression. Timestamp logged shortly after the run. |
+| 2026-07-18T12:54:52-04:00 | direct | 29.873 | 62.770 | 6.079 | Release build, process-cold, `Why is the sky blue?`, 200-token cap (ended at cap), model `qwopus-3.5-9b-coder-q4-k-m`. CUDA-resident hidden-state bridge working tree based on `71faafd`; 16-token CUDA oracle matched before this run. |
+| 2026-07-18T12:54:52-04:00 | thinking | 29.672 | 63.826 | 5.856 | Release build, process-cold, `Why is the sky blue?`, 200-token cap (ended at cap), model `qwopus-3.5-9b-coder-q4-k-m`. CUDA-resident hidden-state bridge working tree based on `71faafd`; 16-token CUDA oracle matched before this run. |
 
 ## Measurement conventions
 
