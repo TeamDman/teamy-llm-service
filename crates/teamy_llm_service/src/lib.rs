@@ -38,6 +38,8 @@ pub struct TopTokensRequest {
     pub thinking_mode: ThinkingMode,
     /// Uses `user_prompt` unchanged rather than rendering the normal Qwen chat envelope.
     pub raw_prompt: bool,
+    /// Preserves an already-tokenized raw prompt for diagnostic continuation without re-tokenizing.
+    pub prompt_token_ids: Option<Vec<u32>>,
     pub top_k: usize,
 }
 
@@ -53,6 +55,7 @@ pub struct TopToken {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TopTokensResult {
     pub rendered_prompt: String,
+    pub input_token_ids: Vec<u32>,
     pub input_token_count: usize,
     pub top_tokens: Vec<TopToken>,
 }
@@ -317,18 +320,35 @@ impl TeamyLlmService {
                 "--raw-prompt cannot be combined with a system prompt",
             ));
         }
-        let rendered_prompt = if request.raw_prompt {
-            request.user_prompt
+        if request.prompt_token_ids.is_some() && !request.raw_prompt {
+            return Err(ServiceError::new(
+                ServiceErrorKind::InvalidRequest,
+                "pre-tokenized top-token inspection requires a raw prompt",
+            ));
+        }
+        let (rendered_prompt, token_ids) = if let Some(token_ids) = request.prompt_token_ids {
+            if token_ids.is_empty() {
+                return Err(ServiceError::new(
+                    ServiceErrorKind::InvalidRequest,
+                    "pre-tokenized top-token inspection requires at least one prompt token",
+                ));
+            }
+            (request.user_prompt, token_ids)
         } else {
-            render_qwen_single_turn_prompt(
-                request.system_prompt.as_deref(),
-                &request.user_prompt,
-                request.thinking_mode,
-            )
-            .prompt
+            let rendered_prompt = if request.raw_prompt {
+                request.user_prompt
+            } else {
+                render_qwen_single_turn_prompt(
+                    request.system_prompt.as_deref(),
+                    &request.user_prompt,
+                    request.thinking_mode,
+                )
+                .prompt
+            };
+            let token_ids = tokenize_rendered_prompt(&artifacts.tokenizer_path, &rendered_prompt)
+                .map_err(map_invalid_request_error)?;
+            (rendered_prompt, token_ids)
         };
-        let token_ids = tokenize_rendered_prompt(&artifacts.tokenizer_path, &rendered_prompt)
-            .map_err(map_invalid_request_error)?;
         let cached_runtime = self.cached_burn_runtime(&artifacts)?;
         let candidates = inspect_top_tokens_with_cached_burn_text_runtime(
             &cached_runtime,
@@ -360,6 +380,7 @@ impl TeamyLlmService {
         Ok(TopTokensResult {
             rendered_prompt,
             input_token_count: token_ids.len(),
+            input_token_ids: token_ids,
             top_tokens,
         })
     }

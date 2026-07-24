@@ -54,6 +54,7 @@ async fn main() -> Result<()> {
         "model" => run_model(service, args).await?,
         "prompt" => run_prompt(service, args, cancellation_token.clone())?,
         "top-tokens" => run_top_tokens(service, args)?,
+        "top-completions" => run_top_completions(service, args)?,
         "benchmark" => run_benchmark(service, args, cancellation_token.clone())?,
         "help" | "--help" | "-h" => print_help(),
         other => bail!("unknown command `{other}`"),
@@ -181,27 +182,9 @@ fn run_prompt(
 }
 
 fn run_top_tokens(service: TeamyLlmService, mut args: Vec<String>) -> Result<()> {
-    let model = take_option_value(&mut args, "--model");
-    let model_dir = take_option_value(&mut args, "--model-dir");
-    let system_prompt = take_option_value(&mut args, "--system-prompt");
-    let thinking_mode = thinking_mode_from_args(&mut args)?;
-    let raw_prompt = take_flag(&mut args, "--raw-prompt");
-    let top_k = take_option_value(&mut args, "--top-k")
-        .map(|value| value.parse::<usize>())
-        .transpose()?
-        .unwrap_or(5);
-    if args.is_empty() {
-        bail!("top-tokens command requires prompt text");
-    }
+    let request = top_tokens_request_from_args(&mut args)?;
     let report = service
-        .inspect_top_tokens(TopTokensRequest {
-            selector: ModelSelector { model, model_dir },
-            system_prompt,
-            user_prompt: args.join(" "),
-            thinking_mode,
-            raw_prompt,
-            top_k,
-        })
+        .inspect_top_tokens(request)
         .map_err(|error| eyre!(error.to_string()))?;
     println!(
         "top_tokens input_token_count={} candidate_count={}",
@@ -218,6 +201,91 @@ fn run_top_tokens(service: TeamyLlmService, mut args: Vec<String>) -> Result<()>
         );
     }
     Ok(())
+}
+
+fn run_top_completions(service: TeamyLlmService, mut args: Vec<String>) -> Result<()> {
+    let max_continuation_tokens = take_option_value(&mut args, "--max-continuation-tokens")
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(12);
+    if max_continuation_tokens == 0 {
+        bail!("--max-continuation-tokens must be at least 1");
+    }
+    let request = top_tokens_request_from_args(&mut args)?;
+    if !request.raw_prompt {
+        bail!(
+            "top-completions requires --raw-prompt so continuations extend the actual model prefix"
+        );
+    }
+    let original_prompt = request.user_prompt.clone();
+    let first_report = service
+        .inspect_top_tokens(request.clone())
+        .map_err(|error| eyre!(error.to_string()))?;
+    println!(
+        "top_completions input_token_count={} initial_candidate_count={} max_continuation_tokens={max_continuation_tokens}",
+        first_report.input_token_count,
+        first_report.top_tokens.len(),
+    );
+    let initial_prompt_token_ids = first_report.input_token_ids;
+    for (rank, first_token) in first_report.top_tokens.into_iter().enumerate() {
+        let mut model_token_ids = initial_prompt_token_ids.clone();
+        let mut continuation_token_ids = vec![first_token.token_id];
+        model_token_ids.push(first_token.token_id);
+        let mut text = first_token.text;
+        while !continuation_reaches_whitespace(&text)
+            && continuation_token_ids.len() < max_continuation_tokens
+        {
+            let mut continuation_request = request.clone();
+            continuation_request.user_prompt = original_prompt.clone();
+            continuation_request.prompt_token_ids = Some(model_token_ids.clone());
+            continuation_request.top_k = 1;
+            let next_token = service
+                .inspect_top_tokens(continuation_request)
+                .map_err(|error| eyre!(error.to_string()))?
+                .top_tokens
+                .into_iter()
+                .next()
+                .ok_or_else(|| eyre!("top-token inspection returned no continuation candidate"))?;
+            model_token_ids.push(next_token.token_id);
+            continuation_token_ids.push(next_token.token_id);
+            text.push_str(&next_token.text);
+        }
+        println!(
+            "rank={} initial_logit={:.6} token_ids={continuation_token_ids:?} text={text:?} stopped_at_whitespace={}",
+            rank + 1,
+            first_token.logit,
+            continuation_reaches_whitespace(&text),
+        );
+    }
+    Ok(())
+}
+
+fn top_tokens_request_from_args(args: &mut Vec<String>) -> Result<TopTokensRequest> {
+    let model = take_option_value(args, "--model");
+    let model_dir = take_option_value(args, "--model-dir");
+    let system_prompt = take_option_value(args, "--system-prompt");
+    let thinking_mode = thinking_mode_from_args(args)?;
+    let raw_prompt = take_flag(args, "--raw-prompt");
+    let top_k = take_option_value(args, "--top-k")
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(5);
+    if args.is_empty() {
+        bail!("top-tokens command requires prompt text");
+    }
+    Ok(TopTokensRequest {
+        selector: ModelSelector { model, model_dir },
+        system_prompt,
+        user_prompt: args.join(" "),
+        thinking_mode,
+        raw_prompt,
+        prompt_token_ids: None,
+        top_k,
+    })
+}
+
+fn continuation_reaches_whitespace(text: &str) -> bool {
+    text.chars().any(char::is_whitespace)
 }
 
 /// Measures a complete request from submission to final token.  `time_to_first_token_ms` therefore
@@ -458,6 +526,9 @@ fn print_help() {
         "teamy-llm top-tokens [--model <name>|--model-dir <path>] [--system-prompt <text>] [--raw-prompt] [--thinking|--no-thinking] [--top-k <n>] <prompt>"
     );
     println!(
+        "teamy-llm top-completions --raw-prompt [--model <name>|--model-dir <path>] [--thinking|--no-thinking] [--top-k <n>] [--max-continuation-tokens <n>] <prompt>"
+    );
+    println!(
         "teamy-llm benchmark [--model <name>|--model-dir <path>] [--system-prompt <text>] [--thinking|--no-thinking|--both-thinking-modes] [--max-new-tokens <n>] [--timeout-ms <ms>] [prompt]"
     );
 }
@@ -465,7 +536,8 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        benchmark_thinking_modes_from_args, stop_after_args_from, thinking_mode_from_args,
+        benchmark_thinking_modes_from_args, continuation_reaches_whitespace, stop_after_args_from,
+        thinking_mode_from_args,
     };
     use std::time::Duration;
     use teamy_llm_core::ThinkingMode;
@@ -526,5 +598,12 @@ mod tests {
             vec![ThinkingMode::Thinking]
         );
         assert!(thinking_args.is_empty());
+    }
+
+    #[test]
+    fn top_completion_stops_after_a_decoded_whitespace_character() {
+        assert!(!continuation_reaches_whitespace("Python"));
+        assert!(continuation_reaches_whitespace("Python "));
+        assert!(continuation_reaches_whitespace("Python\n"));
     }
 }
