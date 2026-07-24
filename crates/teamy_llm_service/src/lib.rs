@@ -38,7 +38,7 @@ pub struct TopTokensRequest {
     pub thinking_mode: ThinkingMode,
     /// Uses `user_prompt` unchanged rather than rendering the normal Qwen chat envelope.
     pub raw_prompt: bool,
-    /// Preserves an already-tokenized raw prompt for diagnostic continuation without re-tokenizing.
+    /// Preserves an already-tokenized prompt for diagnostic continuation without re-tokenizing.
     pub prompt_token_ids: Option<Vec<u32>>,
     pub top_k: usize,
 }
@@ -318,12 +318,6 @@ impl TeamyLlmService {
             return Err(ServiceError::new(
                 ServiceErrorKind::InvalidRequest,
                 "--raw-prompt cannot be combined with a system prompt",
-            ));
-        }
-        if request.prompt_token_ids.is_some() && !request.raw_prompt {
-            return Err(ServiceError::new(
-                ServiceErrorKind::InvalidRequest,
-                "pre-tokenized top-token inspection requires a raw prompt",
             ));
         }
         let (rendered_prompt, token_ids) = if let Some(token_ids) = request.prompt_token_ids {

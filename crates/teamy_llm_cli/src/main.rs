@@ -213,11 +213,6 @@ fn run_top_completions(service: TeamyLlmService, mut args: Vec<String>) -> Resul
         bail!("--max-continuation-tokens must be at least 1");
     }
     let request = top_tokens_request_from_args(&mut args)?;
-    if !request.raw_prompt {
-        bail!(
-            "top-completions requires --raw-prompt so continuations extend the actual model prefix"
-        );
-    }
     let original_prompt = request.user_prompt.clone();
     let first_report = service
         .inspect_top_tokens(request.clone())
@@ -528,7 +523,7 @@ fn print_help() {
         "teamy-llm top-tokens [--model <name>|--model-dir <path>] [--system-prompt <text>] [--raw-prompt] [--thinking|--no-thinking] [--top-k <n>] <prompt>"
     );
     println!(
-        "teamy-llm top-completions --raw-prompt [--full-continuation] [--model <name>|--model-dir <path>] [--thinking|--no-thinking] [--top-k <n>] [--max-continuation-tokens <n>] <prompt>"
+        "teamy-llm top-completions [--raw-prompt] [--full-continuation] [--model <name>|--model-dir <path>] [--thinking|--no-thinking] [--top-k <n>] [--max-continuation-tokens <n>] <prompt>"
     );
     println!(
         "teamy-llm benchmark [--model <name>|--model-dir <path>] [--system-prompt <text>] [--thinking|--no-thinking|--both-thinking-modes] [--max-new-tokens <n>] [--timeout-ms <ms>] [prompt]"
