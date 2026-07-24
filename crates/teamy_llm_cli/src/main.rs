@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 use color_eyre::eyre::{Result, bail, eyre};
 use teamy_cancellation::{CancellationToken, CtrlCHandler, StopAfterArgs};
 use teamy_llm_core::{GenerateEvent, GenerateRequest, ModelSelector, PrepareEvent, ThinkingMode};
-use teamy_llm_service::{TeamyLlmService, TopTokensRequest, default_prepare_request};
+use teamy_llm_service::{
+    RankContinuationsRequest, TeamyLlmService, TopTokensRequest, default_prepare_request,
+};
 use tracing_subscriber::prelude::*;
 
 #[tokio::main]
@@ -55,6 +57,7 @@ async fn main() -> Result<()> {
         "prompt" => run_prompt(service, args, cancellation_token.clone())?,
         "top-tokens" => run_top_tokens(service, args)?,
         "top-completions" => run_top_completions(service, args)?,
+        "rank" => run_rank(service, args)?,
         "benchmark" => run_benchmark(service, args, cancellation_token.clone())?,
         "help" | "--help" | "-h" => print_help(),
         other => bail!("unknown command `{other}`"),
@@ -285,6 +288,48 @@ fn continuation_reaches_whitespace(text: &str) -> bool {
     text.chars().any(char::is_whitespace)
 }
 
+fn run_rank(service: TeamyLlmService, mut args: Vec<String>) -> Result<()> {
+    let model = take_option_value(&mut args, "--model");
+    let model_dir = take_option_value(&mut args, "--model-dir");
+    let system_prompt = take_option_value(&mut args, "--system-prompt");
+    let thinking_mode = thinking_mode_from_args(&mut args)?;
+    let raw_prompt = take_flag(&mut args, "--raw-prompt");
+    let candidates = take_repeated_option_values(&mut args, "--candidate")?;
+    if args.is_empty() {
+        bail!("rank command requires prompt text");
+    }
+    if candidates.is_empty() {
+        bail!("rank command requires at least one --candidate");
+    }
+    let report = service
+        .rank_continuations(RankContinuationsRequest {
+            selector: ModelSelector { model, model_dir },
+            system_prompt,
+            user_prompt: args.join(" "),
+            thinking_mode,
+            raw_prompt,
+            candidates,
+        })
+        .map_err(|error| eyre!(error.to_string()))?;
+    println!(
+        "rank prompt_token_count={} candidate_count={}",
+        report.prompt_token_count,
+        report.rankings.len()
+    );
+    for (rank, candidate) in report.rankings.iter().enumerate() {
+        println!(
+            "rank={} token_count={} mean_log_probability={:.6} mean_negative_log_likelihood={:.6} perplexity={:.6} candidate={:?}",
+            rank + 1,
+            candidate.token_count,
+            candidate.mean_log_probability,
+            candidate.mean_negative_log_likelihood,
+            candidate.perplexity,
+            candidate.candidate,
+        );
+    }
+    Ok(())
+}
+
 /// Measures a complete request from submission to final token.  `time_to_first_token_ms` therefore
 /// includes CUDA validation, model initialization, prompt processing, and the first decode step.
 /// `tokens_per_second` measures decode throughput after the first token arrives.
@@ -503,6 +548,23 @@ fn take_option_value(args: &mut Vec<String>, flag: &str) -> Option<String> {
     }
 }
 
+fn take_repeated_option_values(args: &mut Vec<String>, flag: &str) -> Result<Vec<String>> {
+    let mut values = Vec::new();
+    while let Some(index) = args.iter().position(|arg| arg == flag) {
+        args.remove(index);
+        let Some(value) = args
+            .get(index)
+            .filter(|value| !value.starts_with('-'))
+            .cloned()
+        else {
+            bail!("{flag} requires a value");
+        };
+        args.remove(index);
+        values.push(value);
+    }
+    Ok(values)
+}
+
 fn default_local_address() -> String {
     "local://teamy-llm-service".to_owned()
 }
@@ -524,6 +586,9 @@ fn print_help() {
     );
     println!(
         "teamy-llm top-completions [--raw-prompt] [--full-continuation] [--model <name>|--model-dir <path>] [--thinking|--no-thinking] [--top-k <n>] [--max-continuation-tokens <n>] <prompt>"
+    );
+    println!(
+        "teamy-llm rank [--raw-prompt] [--model <name>|--model-dir <path>] [--system-prompt <text>] [--thinking|--no-thinking] --candidate <text> [--candidate <text> ...] <prompt>"
     );
     println!(
         "teamy-llm benchmark [--model <name>|--model-dir <path>] [--system-prompt <text>] [--thinking|--no-thinking|--both-thinking-modes] [--max-new-tokens <n>] [--timeout-ms <ms>] [prompt]"

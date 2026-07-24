@@ -10,7 +10,8 @@ use teamy_llm_burn_qwen35::burn_text::{
     GenerationEventSink as BackendGenerationEventSink,
     generate_with_cached_burn_text_runtime_to_sink,
     inspect_top_tokens_with_cached_burn_text_runtime, is_generation_cancelled_error,
-    is_generation_timeout_error, load_cached_burn_text_cuda_runtime, verify_required_cuda_runtime,
+    is_generation_timeout_error, load_cached_burn_text_cuda_runtime,
+    score_continuation_with_cached_burn_text_runtime, verify_required_cuda_runtime,
 };
 use teamy_llm_burn_qwen35::model::{
     DEFAULT_LLM_MODEL_NAME, LlmModelArtifacts, LlmModelPreparationState, inspect_model_dir,
@@ -58,6 +59,36 @@ pub struct TopTokensResult {
     pub input_token_ids: Vec<u32>,
     pub input_token_count: usize,
     pub top_tokens: Vec<TopToken>,
+}
+
+/// Parameters for ranking candidate continuations by the local model's conditional likelihood.
+#[derive(Clone, Debug)]
+pub struct RankContinuationsRequest {
+    pub selector: ModelSelector,
+    pub system_prompt: Option<String>,
+    pub user_prompt: String,
+    pub thinking_mode: ThinkingMode,
+    pub raw_prompt: bool,
+    pub candidates: Vec<String>,
+}
+
+/// One candidate ranked by length-normalized causal likelihood.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RankedContinuation {
+    pub candidate: String,
+    pub token_count: usize,
+    pub total_log_probability: f64,
+    pub mean_log_probability: f64,
+    pub mean_negative_log_likelihood: f64,
+    pub perplexity: f64,
+}
+
+/// Candidate rankings and the prompt used to score them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RankContinuationsResult {
+    pub rendered_prompt: String,
+    pub prompt_token_count: usize,
+    pub rankings: Vec<RankedContinuation>,
 }
 
 impl<F> GenerateEventSink for F
@@ -376,6 +407,103 @@ impl TeamyLlmService {
             input_token_count: token_ids.len(),
             input_token_ids: token_ids,
             top_tokens,
+        })
+    }
+
+    /// Rank candidate continuations by their length-normalized conditional likelihood.
+    pub fn rank_continuations(
+        &self,
+        request: RankContinuationsRequest,
+    ) -> Result<RankContinuationsResult, ServiceError> {
+        if request.candidates.is_empty() {
+            return Err(ServiceError::new(
+                ServiceErrorKind::InvalidRequest,
+                "rank command requires at least one candidate continuation",
+            ));
+        }
+        if request.raw_prompt && request.system_prompt.is_some() {
+            return Err(ServiceError::new(
+                ServiceErrorKind::InvalidRequest,
+                "--raw-prompt cannot be combined with a system prompt",
+            ));
+        }
+        verify_required_cuda_runtime().map_err(map_generation_error)?;
+        let model_dir = self.resolve_model_dir(&request.selector)?;
+        let queue = self.queue_for_model(&model_dir)?;
+        let _queue_guard = queue.lock().map_err(|_| {
+            ServiceError::new(
+                ServiceErrorKind::Internal,
+                "model generation queue mutex poisoned",
+            )
+        })?;
+
+        let artifacts = self.inspect_artifacts(&model_dir)?;
+        let burn_support = inspect_burn_runtime_support(&artifacts).map_err(map_internal_error)?;
+        if burn_support.state != BurnLlmSupportState::Ready {
+            return Err(ServiceError::new(
+                ServiceErrorKind::ModelNotPrepared,
+                format!(
+                    "model at {} is not ready for Burn continuation ranking: {}",
+                    artifacts.root.display(),
+                    burn_support.reason
+                ),
+            ));
+        }
+        let rendered_prompt = if request.raw_prompt {
+            request.user_prompt
+        } else {
+            render_qwen_single_turn_prompt(
+                request.system_prompt.as_deref(),
+                &request.user_prompt,
+                request.thinking_mode,
+            )
+            .prompt
+        };
+        let prompt_token_ids =
+            tokenize_rendered_prompt(&artifacts.tokenizer_path, &rendered_prompt)
+                .map_err(map_invalid_request_error)?;
+        let tokenizer = tokenizers::Tokenizer::from_file(&artifacts.tokenizer_path)
+            .map_err(|error| ServiceError::new(ServiceErrorKind::Internal, error.to_string()))?;
+        let cached_runtime = self.cached_burn_runtime(&artifacts)?;
+        let mut rankings = Vec::with_capacity(request.candidates.len());
+        for candidate in request.candidates {
+            let candidate_ids = tokenizer
+                .encode(candidate.as_str(), false)
+                .map_err(|error| {
+                    ServiceError::new(ServiceErrorKind::InvalidRequest, error.to_string())
+                })?
+                .get_ids()
+                .to_vec();
+            if candidate_ids.is_empty() {
+                return Err(ServiceError::new(
+                    ServiceErrorKind::InvalidRequest,
+                    format!("candidate {:?} produced no tokens", candidate),
+                ));
+            }
+            let score = score_continuation_with_cached_burn_text_runtime(
+                &cached_runtime,
+                &prompt_token_ids,
+                &candidate_ids,
+            )
+            .map_err(map_generation_error)?;
+            rankings.push(RankedContinuation {
+                candidate,
+                token_count: score.token_count,
+                total_log_probability: score.total_log_probability,
+                mean_log_probability: score.mean_log_probability,
+                mean_negative_log_likelihood: score.mean_negative_log_likelihood,
+                perplexity: score.perplexity,
+            });
+        }
+        rankings.sort_by(|left, right| {
+            left.mean_negative_log_likelihood
+                .total_cmp(&right.mean_negative_log_likelihood)
+                .then_with(|| left.candidate.cmp(&right.candidate))
+        });
+        Ok(RankContinuationsResult {
+            rendered_prompt,
+            prompt_token_count: prompt_token_ids.len(),
+            rankings,
         })
     }
 

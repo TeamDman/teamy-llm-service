@@ -326,6 +326,16 @@ pub struct BurnTextTopToken {
     pub logit: f32,
 }
 
+/// Length-normalized causal score for one candidate continuation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BurnTextContinuationScore {
+    pub token_count: usize,
+    pub total_log_probability: f64,
+    pub mean_log_probability: f64,
+    pub mean_negative_log_likelihood: f64,
+    pub perplexity: f64,
+}
+
 #[derive(Clone, Debug)]
 pub struct BurnTextGenerationOptions {
     pub max_new_tokens: usize,
@@ -2417,6 +2427,49 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         self.top_next_tokens_from_hidden(&last_hidden, top_k)
     }
 
+    fn score_continuation(
+        &self,
+        prompt_token_ids: &[u32],
+        candidate_token_ids: &[u32],
+    ) -> eyre::Result<BurnTextContinuationScore> {
+        ensure!(
+            !prompt_token_ids.is_empty(),
+            "Continuation scoring requires at least one prompt token"
+        );
+        ensure!(
+            !candidate_token_ids.is_empty(),
+            "Continuation scoring requires at least one candidate token"
+        );
+        let mut input_token_ids = Vec::with_capacity(
+            prompt_token_ids
+                .len()
+                .checked_add(candidate_token_ids.len())
+                .ok_or_else(|| eyre::eyre!("Continuation token count overflow"))?,
+        );
+        input_token_ids.extend_from_slice(prompt_token_ids);
+        input_token_ids.extend_from_slice(candidate_token_ids);
+        let hidden_states =
+            self.forward_hidden_states(self.embedding_hidden_states(&input_token_ids)?)?;
+        let lm_head_name = if self.manifest.tensors.contains_key("lm_head.weight") {
+            "lm_head.weight"
+        } else {
+            "model.embed_tokens.weight"
+        };
+        let logits = linear_forward_3d(&hidden_states, self.load_tensor_2d(lm_head_name)?, None);
+        let [batch_size, sequence_len, vocab_size] = logits.dims();
+        ensure!(
+            batch_size == 1,
+            "Continuation scoring expected batch size 1"
+        );
+        score_continuation_logits(
+            &tensor_to_vec_f32(&logits)?,
+            sequence_len,
+            vocab_size,
+            prompt_token_ids.len(),
+            candidate_token_ids,
+        )
+    }
+
     fn greedy_next_token_from_hidden(&self, hidden: &[f32]) -> eyre::Result<usize> {
         llm_tracy_zone!("llm_burn_lm_head_scan");
         #[cfg(feature = "extended_observability")]
@@ -3813,6 +3866,26 @@ pub fn inspect_top_tokens_with_cached_burn_text_runtime(
     cached_runtime.runtime.top_next_tokens(hidden_states, top_k)
 }
 
+/// Score one candidate continuation with a retained CUDA runtime.
+///
+/// The returned mean negative log-likelihood is a length-normalized error: lower values indicate
+/// that the model assigned higher conditional probability to the candidate.
+///
+/// # Errors
+///
+/// This function returns an error when CUDA is unavailable, either token sequence is empty, or
+/// the model cannot complete its forward pass.
+pub fn score_continuation_with_cached_burn_text_runtime(
+    cached_runtime: &CachedBurnTextCudaRuntime,
+    prompt_token_ids: &[u32],
+    candidate_token_ids: &[u32],
+) -> eyre::Result<BurnTextContinuationScore> {
+    verify_required_cuda_runtime()?;
+    cached_runtime
+        .runtime
+        .score_continuation(prompt_token_ids, candidate_token_ids)
+}
+
 fn generate_with_burn_text_runtime_inner(
     artifacts: &LlmModelArtifacts,
     prompt_token_ids: &[u32],
@@ -4536,6 +4609,59 @@ fn rank_top_logits(logits: Vec<f32>, top_k: usize) -> Vec<BurnTextTopToken> {
     });
     candidates.truncate(top_k.min(candidates.len()));
     candidates
+}
+
+fn score_continuation_logits(
+    logits: &[f32],
+    sequence_len: usize,
+    vocab_size: usize,
+    prompt_token_count: usize,
+    candidate_token_ids: &[u32],
+) -> eyre::Result<BurnTextContinuationScore> {
+    ensure!(
+        vocab_size > 0,
+        "Continuation scoring requires a non-empty vocabulary"
+    );
+    ensure!(
+        prompt_token_count
+            .checked_add(candidate_token_ids.len())
+            .is_some_and(|length| length == sequence_len),
+        "Continuation logits shape did not match prompt and candidate lengths"
+    );
+    ensure!(
+        logits.len() == sequence_len.saturating_mul(vocab_size),
+        "Continuation logits length did not match its shape"
+    );
+    let mut total_log_probability = 0.0_f64;
+    for (candidate_index, token_id) in candidate_token_ids.iter().copied().enumerate() {
+        let token_id = usize::try_from(token_id)
+            .map_err(|_| eyre::eyre!("Candidate token id exceeded usize range"))?;
+        ensure!(
+            token_id < vocab_size,
+            "Candidate token id {token_id} exceeded vocabulary size {vocab_size}"
+        );
+        let row_start = (prompt_token_count - 1 + candidate_index)
+            .checked_mul(vocab_size)
+            .ok_or_else(|| eyre::eyre!("Continuation logits row offset overflow"))?;
+        let row = &logits[row_start..row_start + vocab_size];
+        let max_logit = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let normalizer = row
+            .iter()
+            .map(|logit| ((*logit as f64) - max_logit).exp())
+            .sum::<f64>()
+            .ln();
+        total_log_probability += row[token_id] as f64 - max_logit - normalizer;
+    }
+    let token_count = candidate_token_ids.len();
+    let mean_log_probability = total_log_probability / token_count as f64;
+    let mean_negative_log_likelihood = -mean_log_probability;
+    Ok(BurnTextContinuationScore {
+        token_count,
+        total_log_probability,
+        mean_log_probability,
+        mean_negative_log_likelihood,
+        perplexity: mean_negative_log_likelihood.exp(),
+    })
 }
 
 fn emit_generated_token(
@@ -6007,9 +6133,9 @@ mod tests {
         fuse_linear_attention_projection_weights, inspect_burn_text_runtime_status,
         is_generation_cancelled_error, linear_forward_3d, parse_nvidia_driver_major,
         parse_nvidia_smi_cuda_version, qwen_rms_norm, qwen_rms_norm_tensor, rank_top_logits,
-        rotary_embeddings, sigmoid_scalar, softmax_scalars, softmax_scalars_in_place,
-        split_fused_linear_attention_projection_values, verify_required_cuda_runtime,
-        verify_required_cuda_runtime_in,
+        rotary_embeddings, score_continuation_logits, sigmoid_scalar, softmax_scalars,
+        softmax_scalars_in_place, split_fused_linear_attention_projection_values,
+        verify_required_cuda_runtime, verify_required_cuda_runtime_in,
     };
     use crate::model::{
         DEFAULT_LLM_MODEL_NAME, HF_CONFIG_FILE_NAME, MODEL_FILE_NAME, TOKENIZER_CONFIG_FILE_NAME,
@@ -6190,6 +6316,26 @@ mod tests {
         );
         assert_eq!(ranked[0].logit, 0.75);
         assert!(rank_top_logits(vec![1.0, 2.0], 0).is_empty());
+    }
+
+    #[test]
+    fn score_continuation_logits_reports_length_normalized_error() {
+        let score = score_continuation_logits(
+            &[
+                0.0, 2.0, 0.0, // prompt position predicts token 1
+                0.0, 0.0, 3.0, // candidate position predicts token 2
+                0.0, 0.0, 0.0,
+            ],
+            3,
+            3,
+            1,
+            &[1, 2],
+        )
+        .expect("candidate logits should score");
+        assert_eq!(score.token_count, 2);
+        assert!(score.mean_log_probability < 0.0);
+        assert!(score.mean_negative_log_likelihood > 0.0);
+        assert!(score.perplexity > 1.0);
     }
 
     #[test]
