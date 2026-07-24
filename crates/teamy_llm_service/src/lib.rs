@@ -8,7 +8,8 @@ use teamy_llm_burn_qwen35::burn_backend::{BurnLlmSupportState, inspect_burn_runt
 use teamy_llm_burn_qwen35::burn_text::{
     BurnTextGenerationOptions, CachedBurnTextCudaRuntime,
     GenerationEventSink as BackendGenerationEventSink,
-    generate_with_cached_burn_text_runtime_to_sink, is_generation_cancelled_error,
+    generate_with_cached_burn_text_runtime_to_sink,
+    inspect_top_tokens_with_cached_burn_text_runtime, is_generation_cancelled_error,
     is_generation_timeout_error, load_cached_burn_text_cuda_runtime, verify_required_cuda_runtime,
 };
 use teamy_llm_burn_qwen35::model::{
@@ -21,11 +22,39 @@ use teamy_llm_burn_qwen35::runtime::{render_qwen_single_turn_prompt, tokenize_re
 use teamy_llm_core::{
     GenerateEvent, GenerateRequest, GenerateResult, ModelLocationStatus, ModelPreparationState,
     ModelReport, ModelSelector, ModelStatus, PrepareEvent, PrepareModelRequest, PrepareModelResult,
-    ServiceError, ServiceErrorKind, ServiceHealth,
+    ServiceError, ServiceErrorKind, ServiceHealth, ThinkingMode,
 };
 
 pub trait GenerateEventSink {
     fn send(&mut self, event: GenerateEvent) -> Result<(), ServiceError>;
+}
+
+/// Parameters for a local CUDA next-token candidate inspection.
+#[derive(Clone, Debug)]
+pub struct TopTokensRequest {
+    pub selector: ModelSelector,
+    pub system_prompt: Option<String>,
+    pub user_prompt: String,
+    pub thinking_mode: ThinkingMode,
+    /// Uses `user_prompt` unchanged rather than rendering the normal Qwen chat envelope.
+    pub raw_prompt: bool,
+    pub top_k: usize,
+}
+
+/// One decoded candidate from a local CUDA next-token inspection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TopToken {
+    pub token_id: u32,
+    pub text: String,
+    pub logit: f32,
+}
+
+/// Next-token candidates and the exact prompt rendered for their inspection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TopTokensResult {
+    pub rendered_prompt: String,
+    pub input_token_count: usize,
+    pub top_tokens: Vec<TopToken>,
 }
 
 impl<F> GenerateEventSink for F
@@ -243,6 +272,95 @@ impl TeamyLlmService {
             rendered_prompt: rendered.prompt,
             generated_token_ids: report.generated_token_ids,
             generated_text: report.generated_text,
+        })
+    }
+
+    /// Return the highest next-token logits from the configured local CUDA model.
+    ///
+    /// Unless `raw_prompt` is set, the prompt is rendered with the same Qwen template and thinking
+    /// mode as normal generation.
+    pub fn inspect_top_tokens(
+        &self,
+        request: TopTokensRequest,
+    ) -> Result<TopTokensResult, ServiceError> {
+        if request.top_k == 0 {
+            return Err(ServiceError::new(
+                ServiceErrorKind::InvalidRequest,
+                "top-k must be at least 1",
+            ));
+        }
+        verify_required_cuda_runtime().map_err(map_generation_error)?;
+        let model_dir = self.resolve_model_dir(&request.selector)?;
+        let queue = self.queue_for_model(&model_dir)?;
+        let _queue_guard = queue.lock().map_err(|_| {
+            ServiceError::new(
+                ServiceErrorKind::Internal,
+                "model generation queue mutex poisoned",
+            )
+        })?;
+
+        let artifacts = self.inspect_artifacts(&model_dir)?;
+        let burn_support = inspect_burn_runtime_support(&artifacts).map_err(map_internal_error)?;
+        if burn_support.state != BurnLlmSupportState::Ready {
+            return Err(ServiceError::new(
+                ServiceErrorKind::ModelNotPrepared,
+                format!(
+                    "model at {} is not ready for Burn top-token inspection: {}",
+                    artifacts.root.display(),
+                    burn_support.reason
+                ),
+            ));
+        }
+        if request.raw_prompt && request.system_prompt.is_some() {
+            return Err(ServiceError::new(
+                ServiceErrorKind::InvalidRequest,
+                "--raw-prompt cannot be combined with a system prompt",
+            ));
+        }
+        let rendered_prompt = if request.raw_prompt {
+            request.user_prompt
+        } else {
+            render_qwen_single_turn_prompt(
+                request.system_prompt.as_deref(),
+                &request.user_prompt,
+                request.thinking_mode,
+            )
+            .prompt
+        };
+        let token_ids = tokenize_rendered_prompt(&artifacts.tokenizer_path, &rendered_prompt)
+            .map_err(map_invalid_request_error)?;
+        let cached_runtime = self.cached_burn_runtime(&artifacts)?;
+        let candidates = inspect_top_tokens_with_cached_burn_text_runtime(
+            &cached_runtime,
+            &token_ids,
+            request.top_k,
+        )
+        .map_err(map_generation_error)?;
+        let tokenizer = tokenizers::Tokenizer::from_file(&artifacts.tokenizer_path)
+            .map_err(|error| ServiceError::new(ServiceErrorKind::Internal, error.to_string()))?;
+        let top_tokens = candidates
+            .into_iter()
+            .map(|candidate| {
+                let token_id = u32::try_from(candidate.token_id).map_err(|_| {
+                    ServiceError::new(
+                        ServiceErrorKind::Internal,
+                        format!("Token id {} exceeded u32 range", candidate.token_id),
+                    )
+                })?;
+                let text = tokenizer.decode(&[token_id], false).map_err(|error| {
+                    ServiceError::new(ServiceErrorKind::Internal, error.to_string())
+                })?;
+                Ok(TopToken {
+                    token_id,
+                    text,
+                    logit: candidate.logit,
+                })
+            })
+            .collect::<Result<Vec<_>, ServiceError>>()?;
+        Ok(TopTokensResult {
+            rendered_prompt,
+            input_token_count: token_ids.len(),
+            top_tokens,
         })
     }
 

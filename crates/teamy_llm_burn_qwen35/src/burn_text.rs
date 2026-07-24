@@ -319,6 +319,13 @@ pub struct BurnTextGenerationReport {
     pub generated_text: String,
 }
 
+/// A token candidate produced by the local model's next-token logits.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BurnTextTopToken {
+    pub token_id: usize,
+    pub logit: f32,
+}
+
 #[derive(Clone, Debug)]
 pub struct BurnTextGenerationOptions {
     pub max_new_tokens: usize,
@@ -2387,6 +2394,29 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         self.greedy_next_token_from_hidden(&last_hidden)
     }
 
+    fn top_next_tokens(
+        &self,
+        hidden_states: Tensor<B, 3>,
+        top_k: usize,
+    ) -> eyre::Result<Vec<BurnTextTopToken>> {
+        ensure!(top_k > 0, "top-k must be at least 1");
+        let [batch_size, seq_len, hidden_size] = hidden_states.dims();
+        ensure!(
+            batch_size == 1,
+            "Qwen3.5 top-token inspection expected batch size 1"
+        );
+        ensure!(
+            seq_len > 0,
+            "Qwen3.5 top-token inspection requires a prompt token"
+        );
+        let last_hidden = tensor_to_vec_f32(&hidden_states)?
+            .chunks_exact(hidden_size)
+            .last()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| eyre::eyre!("Missing final hidden state during top-token inspection"))?;
+        self.top_next_tokens_from_hidden(&last_hidden, top_k)
+    }
+
     fn greedy_next_token_from_hidden(&self, hidden: &[f32]) -> eyre::Result<usize> {
         llm_tracy_zone!("llm_burn_lm_head_scan");
         #[cfg(feature = "extended_observability")]
@@ -2563,6 +2593,24 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             hidden.to_vec(),
             &self.device,
         ))
+    }
+
+    fn top_next_tokens_from_hidden(
+        &self,
+        hidden: &[f32],
+        top_k: usize,
+    ) -> eyre::Result<Vec<BurnTextTopToken>> {
+        let lm_head_name = if self.manifest.tensors.contains_key("lm_head.weight") {
+            "lm_head.weight"
+        } else {
+            "model.embed_tokens.weight"
+        };
+        let logits = linear_forward_3d(
+            &tensor_3d([1, 1, hidden.len()], hidden.to_vec(), &self.device),
+            self.load_tensor_2d(lm_head_name)?,
+            None,
+        );
+        Ok(rank_top_logits(tensor_to_vec_f32(&logits)?, top_k))
     }
 
     fn greedy_next_token_from_hidden_device_tensor(
@@ -3738,6 +3786,33 @@ pub fn generate_with_cached_burn_text_runtime_to_sink(
     }
 }
 
+/// Inspect the highest next-token logits with a retained CUDA runtime.
+///
+/// This is a diagnostic operation. It does not alter generation state or select a CPU inference
+/// path; the final logits are transferred to the host only to rank and report candidates.
+///
+/// # Errors
+///
+/// This function returns an error when CUDA is unavailable, the prompt is empty, or the model
+/// cannot complete its forward pass.
+pub fn inspect_top_tokens_with_cached_burn_text_runtime(
+    cached_runtime: &CachedBurnTextCudaRuntime,
+    prompt_token_ids: &[u32],
+    top_k: usize,
+) -> eyre::Result<Vec<BurnTextTopToken>> {
+    verify_required_cuda_runtime()?;
+    ensure!(
+        !prompt_token_ids.is_empty(),
+        "Top-token inspection requires at least one prompt token"
+    );
+    let hidden_states = cached_runtime.runtime.forward_hidden_states(
+        cached_runtime
+            .runtime
+            .embedding_hidden_states(prompt_token_ids)?,
+    )?;
+    cached_runtime.runtime.top_next_tokens(hidden_states, top_k)
+}
+
 fn generate_with_burn_text_runtime_inner(
     artifacts: &LlmModelArtifacts,
     prompt_token_ids: &[u32],
@@ -4445,6 +4520,22 @@ fn decode_token_ids_with_tokenizer(
     tokenizer
         .decode(&token_ids, skip_special_tokens)
         .map_err(|error| eyre::eyre!("Failed to decode generated token ids: {}", error))
+}
+
+fn rank_top_logits(logits: Vec<f32>, top_k: usize) -> Vec<BurnTextTopToken> {
+    let mut candidates = logits
+        .into_iter()
+        .enumerate()
+        .map(|(token_id, logit)| BurnTextTopToken { token_id, logit })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by(|left, right| {
+        right
+            .logit
+            .total_cmp(&left.logit)
+            .then_with(|| left.token_id.cmp(&right.token_id))
+    });
+    candidates.truncate(top_k.min(candidates.len()));
+    candidates
 }
 
 fn emit_generated_token(
@@ -5915,8 +6006,8 @@ mod tests {
         dot_product, export_burn_text_weights, f16_bits_to_f32, first_mismatch_index,
         fuse_linear_attention_projection_weights, inspect_burn_text_runtime_status,
         is_generation_cancelled_error, linear_forward_3d, parse_nvidia_driver_major,
-        parse_nvidia_smi_cuda_version, qwen_rms_norm, qwen_rms_norm_tensor, rotary_embeddings,
-        sigmoid_scalar, softmax_scalars, softmax_scalars_in_place,
+        parse_nvidia_smi_cuda_version, qwen_rms_norm, qwen_rms_norm_tensor, rank_top_logits,
+        rotary_embeddings, sigmoid_scalar, softmax_scalars, softmax_scalars_in_place,
         split_fused_linear_attention_projection_values, verify_required_cuda_runtime,
         verify_required_cuda_runtime_in,
     };
@@ -6085,6 +6176,20 @@ mod tests {
         for (left, right) in expected.iter().zip(actual.iter()) {
             assert!((left - right).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn rank_top_logits_orders_descending_and_breaks_ties_by_token_id() {
+        let ranked = rank_top_logits(vec![0.25, 0.75, 0.75, -1.0], 3);
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|candidate| candidate.token_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 0]
+        );
+        assert_eq!(ranked[0].logit, 0.75);
+        assert!(rank_top_logits(vec![1.0, 2.0], 0).is_empty());
     }
 
     #[test]

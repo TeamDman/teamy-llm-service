@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use color_eyre::eyre::{Result, bail, eyre};
 use teamy_cancellation::{CancellationToken, CtrlCHandler, StopAfterArgs};
 use teamy_llm_core::{GenerateEvent, GenerateRequest, ModelSelector, PrepareEvent, ThinkingMode};
-use teamy_llm_service::{TeamyLlmService, default_prepare_request};
+use teamy_llm_service::{TeamyLlmService, TopTokensRequest, default_prepare_request};
 use tracing_subscriber::prelude::*;
 
 #[tokio::main]
@@ -53,6 +53,7 @@ async fn main() -> Result<()> {
         }
         "model" => run_model(service, args).await?,
         "prompt" => run_prompt(service, args, cancellation_token.clone())?,
+        "top-tokens" => run_top_tokens(service, args)?,
         "benchmark" => run_benchmark(service, args, cancellation_token.clone())?,
         "help" | "--help" | "-h" => print_help(),
         other => bail!("unknown command `{other}`"),
@@ -176,6 +177,46 @@ fn run_prompt(
         })
         .map_err(|error| eyre!(error.to_string()))?;
     println!();
+    Ok(())
+}
+
+fn run_top_tokens(service: TeamyLlmService, mut args: Vec<String>) -> Result<()> {
+    let model = take_option_value(&mut args, "--model");
+    let model_dir = take_option_value(&mut args, "--model-dir");
+    let system_prompt = take_option_value(&mut args, "--system-prompt");
+    let thinking_mode = thinking_mode_from_args(&mut args)?;
+    let raw_prompt = take_flag(&mut args, "--raw-prompt");
+    let top_k = take_option_value(&mut args, "--top-k")
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(5);
+    if args.is_empty() {
+        bail!("top-tokens command requires prompt text");
+    }
+    let report = service
+        .inspect_top_tokens(TopTokensRequest {
+            selector: ModelSelector { model, model_dir },
+            system_prompt,
+            user_prompt: args.join(" "),
+            thinking_mode,
+            raw_prompt,
+            top_k,
+        })
+        .map_err(|error| eyre!(error.to_string()))?;
+    println!(
+        "top_tokens input_token_count={} candidate_count={}",
+        report.input_token_count,
+        report.top_tokens.len()
+    );
+    for (rank, token) in report.top_tokens.iter().enumerate() {
+        println!(
+            "rank={} token_id={} logit={:.6} text={:?}",
+            rank + 1,
+            token.token_id,
+            token.logit,
+            token.text
+        );
+    }
     Ok(())
 }
 
@@ -412,6 +453,9 @@ fn print_help() {
     );
     println!(
         "teamy-llm prompt [--stop-after <span-or-message>] [--stop-after-duration <duration>] [--model <name>|--model-dir <path>] [--system-prompt <text>] [--thinking|--no-thinking] [--max-new-tokens <n>] [--timeout-ms <ms>] <prompt>"
+    );
+    println!(
+        "teamy-llm top-tokens [--model <name>|--model-dir <path>] [--system-prompt <text>] [--raw-prompt] [--thinking|--no-thinking] [--top-k <n>] <prompt>"
     );
     println!(
         "teamy-llm benchmark [--model <name>|--model-dir <path>] [--system-prompt <text>] [--thinking|--no-thinking|--both-thinking-modes] [--max-new-tokens <n>] [--timeout-ms <ms>] [prompt]"
