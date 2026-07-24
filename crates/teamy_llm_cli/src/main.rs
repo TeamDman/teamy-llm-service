@@ -204,6 +204,7 @@ fn run_top_tokens(service: TeamyLlmService, mut args: Vec<String>) -> Result<()>
 }
 
 fn run_top_completions(service: TeamyLlmService, mut args: Vec<String>) -> Result<()> {
+    let full_continuation = take_flag(&mut args, "--full-continuation");
     let max_continuation_tokens = take_option_value(&mut args, "--max-continuation-tokens")
         .map(|value| value.parse::<usize>())
         .transpose()?
@@ -232,7 +233,7 @@ fn run_top_completions(service: TeamyLlmService, mut args: Vec<String>) -> Resul
         let mut continuation_token_ids = vec![first_token.token_id];
         model_token_ids.push(first_token.token_id);
         let mut text = first_token.text;
-        while !continuation_reaches_whitespace(&text)
+        while (full_continuation || !continuation_reaches_whitespace(&text))
             && continuation_token_ids.len() < max_continuation_tokens
         {
             let mut continuation_request = request.clone();
@@ -251,9 +252,10 @@ fn run_top_completions(service: TeamyLlmService, mut args: Vec<String>) -> Resul
             text.push_str(&next_token.text);
         }
         println!(
-            "rank={} initial_logit={:.6} token_ids={continuation_token_ids:?} text={text:?} stopped_at_whitespace={}",
+            "rank={} initial_logit={:.6} token_count={} token_ids={continuation_token_ids:?} text={text:?} stopped_at_whitespace={}",
             rank + 1,
             first_token.logit,
+            continuation_token_ids.len(),
             continuation_reaches_whitespace(&text),
         );
     }
@@ -526,7 +528,7 @@ fn print_help() {
         "teamy-llm top-tokens [--model <name>|--model-dir <path>] [--system-prompt <text>] [--raw-prompt] [--thinking|--no-thinking] [--top-k <n>] <prompt>"
     );
     println!(
-        "teamy-llm top-completions --raw-prompt [--model <name>|--model-dir <path>] [--thinking|--no-thinking] [--top-k <n>] [--max-continuation-tokens <n>] <prompt>"
+        "teamy-llm top-completions --raw-prompt [--full-continuation] [--model <name>|--model-dir <path>] [--thinking|--no-thinking] [--top-k <n>] [--max-continuation-tokens <n>] <prompt>"
     );
     println!(
         "teamy-llm benchmark [--model <name>|--model-dir <path>] [--system-prompt <text>] [--thinking|--no-thinking|--both-thinking-modes] [--max-new-tokens <n>] [--timeout-ms <ms>] [prompt]"
