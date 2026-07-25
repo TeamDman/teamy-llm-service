@@ -25,7 +25,7 @@ use std::{
     marker::PhantomData,
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -41,6 +41,7 @@ pub const BURN_TEXT_DIR_NAME: &str = "burn-text";
 pub const BURN_TEXT_MANIFEST_FILE_NAME: &str = "burn-text-manifest.json";
 pub const DEFAULT_BURN_TEXT_EXPORT_DTYPE: &str = "float16";
 const DEFAULT_LOGIT_CHUNK_ROWS: usize = 512;
+const DEFAULT_PROMPT_PREFILL_CACHE_CAPACITY: usize = 8;
 const SOURCE_SAFETENSORS_INDEX_FILE_NAME: &str = "model.safetensors.index.json";
 
 pub type LlmCudaBackend = Cuda<f16, i32>;
@@ -484,6 +485,58 @@ struct Qwen35TextRuntime<B: Backend> {
 #[derive(Debug)]
 pub struct CachedBurnTextCudaRuntime {
     runtime: Qwen35TextRuntime<LlmCudaBackend>,
+    prompt_prefill_cache: Mutex<PromptPrefillCache<PromptPrefillState>>,
+}
+
+/// A prompt's decoder state and final hidden state can be reused for every candidate that shares
+/// that prompt. The decoder state is cloned before candidate decoding so ranking remains isolated
+/// between candidates.
+#[derive(Debug)]
+struct PromptPrefillState {
+    final_hidden: Tensor<LlmCudaBackend, 3>,
+    decode_state: Qwen35DecodeState,
+}
+
+#[derive(Debug)]
+struct PromptPrefillCache<T> {
+    capacity: usize,
+    entries: HashMap<Vec<u32>, Arc<T>>,
+    recency: VecDeque<Vec<u32>>,
+}
+
+impl<T> PromptPrefillCache<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: HashMap::new(),
+            recency: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, key: &[u32]) -> Option<Arc<T>> {
+        let state = self.entries.get(key).cloned()?;
+        self.touch(key);
+        Some(state)
+    }
+
+    fn insert(&mut self, key: Vec<u32>, state: Arc<T>) {
+        if self.capacity == 0 {
+            return;
+        }
+        self.entries.insert(key.clone(), state);
+        self.touch(&key);
+        while self.entries.len() > self.capacity {
+            let Some(oldest) = self.recency.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn touch(&mut self, key: &[u32]) {
+        self.recency.retain(|entry| entry.as_slice() != key);
+        self.recency.push_back(key.to_vec());
+    }
 }
 
 #[allow(dead_code)]
@@ -2427,47 +2480,87 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         self.top_next_tokens_from_hidden(&last_hidden, top_k)
     }
 
-    fn score_continuation(
+    fn final_hidden_tensor(&self, hidden_states: &Tensor<B, 3>) -> eyre::Result<Tensor<B, 3>> {
+        let [batch_size, sequence_len, hidden_size] = hidden_states.dims();
+        ensure!(
+            batch_size == 1,
+            "Qwen3.5 prompt prefill expected batch size 1, but received {batch_size}"
+        );
+        ensure!(
+            sequence_len > 0,
+            "Qwen3.5 prompt prefill requires at least one token"
+        );
+        let values = tensor_to_vec_f32(hidden_states)?;
+        let final_start = (sequence_len - 1)
+            .checked_mul(hidden_size)
+            .ok_or_else(|| eyre::eyre!("Final hidden-state offset overflow"))?;
+        let final_end = final_start
+            .checked_add(hidden_size)
+            .ok_or_else(|| eyre::eyre!("Final hidden-state end offset overflow"))?;
+        ensure!(
+            final_end <= values.len(),
+            "Final hidden state was shorter than its declared shape"
+        );
+        Ok(tensor_3d(
+            [1, 1, hidden_size],
+            values[final_start..final_end].to_vec(),
+            &self.device,
+        ))
+    }
+
+    fn lm_head_logits_from_hidden_tensor(
         &self,
-        prompt_token_ids: &[u32],
-        candidate_token_ids: &[u32],
-    ) -> eyre::Result<BurnTextContinuationScore> {
-        ensure!(
-            !prompt_token_ids.is_empty(),
-            "Continuation scoring requires at least one prompt token"
-        );
-        ensure!(
-            !candidate_token_ids.is_empty(),
-            "Continuation scoring requires at least one candidate token"
-        );
-        let mut input_token_ids = Vec::with_capacity(
-            prompt_token_ids
-                .len()
-                .checked_add(candidate_token_ids.len())
-                .ok_or_else(|| eyre::eyre!("Continuation token count overflow"))?,
-        );
-        input_token_ids.extend_from_slice(prompt_token_ids);
-        input_token_ids.extend_from_slice(candidate_token_ids);
-        let hidden_states =
-            self.forward_hidden_states(self.embedding_hidden_states(&input_token_ids)?)?;
+        hidden: Tensor<B, 3>,
+    ) -> eyre::Result<(Vec<f32>, usize)> {
         let lm_head_name = if self.manifest.tensors.contains_key("lm_head.weight") {
             "lm_head.weight"
         } else {
             "model.embed_tokens.weight"
         };
-        let logits = linear_forward_3d(&hidden_states, self.load_tensor_2d(lm_head_name)?, None);
+        let logits = linear_forward_3d(&hidden, self.load_tensor_2d(lm_head_name)?, None);
         let [batch_size, sequence_len, vocab_size] = logits.dims();
         ensure!(
-            batch_size == 1,
-            "Continuation scoring expected batch size 1"
+            batch_size == 1 && sequence_len == 1,
+            "Single-token lm_head expected shape [1, 1, vocab], but found [{batch_size}, {sequence_len}, {vocab_size}]"
         );
-        score_continuation_logits(
-            &tensor_to_vec_f32(&logits)?,
-            sequence_len,
-            vocab_size,
-            prompt_token_ids.len(),
-            candidate_token_ids,
-        )
+        Ok((tensor_to_vec_f32(&logits)?, vocab_size))
+    }
+
+    fn score_continuation_from_prefill(
+        &self,
+        final_hidden: Tensor<B, 3>,
+        mut decode_state: Qwen35DecodeState,
+        candidate_token_ids: &[u32],
+    ) -> eyre::Result<BurnTextContinuationScore> {
+        ensure!(
+            !candidate_token_ids.is_empty(),
+            "Continuation scoring requires at least one candidate token"
+        );
+        let (first_logits, vocab_size) = self.lm_head_logits_from_hidden_tensor(final_hidden)?;
+        let mut total_log_probability =
+            log_probability_for_token(&first_logits, vocab_size, candidate_token_ids[0])?;
+
+        for candidate_index in 1..candidate_token_ids.len() {
+            let previous_token_id = candidate_token_ids[candidate_index - 1];
+            let hidden = self.forward_token_hidden_tensor(&mut decode_state, previous_token_id)?;
+            let (logits, vocab_size) = self.lm_head_logits_from_hidden_tensor(hidden)?;
+            total_log_probability += log_probability_for_token(
+                &logits,
+                vocab_size,
+                candidate_token_ids[candidate_index],
+            )?;
+        }
+
+        let token_count = candidate_token_ids.len();
+        let mean_log_probability = total_log_probability / token_count as f64;
+        let mean_negative_log_likelihood = -mean_log_probability;
+        Ok(BurnTextContinuationScore {
+            token_count,
+            total_log_probability,
+            mean_log_probability,
+            mean_negative_log_likelihood,
+            perplexity: mean_negative_log_likelihood.exp(),
+        })
     }
 
     fn greedy_next_token_from_hidden(&self, hidden: &[f32]) -> eyre::Result<usize> {
@@ -3794,7 +3887,67 @@ pub fn load_cached_burn_text_cuda_runtime(
             llm_inference_cuda_device(),
             "cuda",
         )?,
+        prompt_prefill_cache: Mutex::new(PromptPrefillCache::new(
+            DEFAULT_PROMPT_PREFILL_CACHE_CAPACITY,
+        )),
     })
+}
+
+impl CachedBurnTextCudaRuntime {
+    fn prompt_prefill_state(
+        &self,
+        prompt_token_ids: &[u32],
+    ) -> eyre::Result<Arc<PromptPrefillState>> {
+        ensure!(
+            !prompt_token_ids.is_empty(),
+            "Continuation scoring requires at least one prompt token"
+        );
+
+        if let Some(state) = self
+            .prompt_prefill_cache
+            .lock()
+            .map_err(|_| eyre::eyre!("Prompt prefill cache mutex was poisoned"))?
+            .get(prompt_token_ids)
+        {
+            tracing::debug!(
+                prompt_token_count = prompt_token_ids.len(),
+                "reusing cached Burn prompt prefill state"
+            );
+            return Ok(state);
+        }
+
+        tracing::debug!(
+            prompt_token_count = prompt_token_ids.len(),
+            "prefilling and caching Burn prompt decoder state"
+        );
+        let embedded = self.runtime.embedding_hidden_states(prompt_token_ids)?;
+        let (hidden_states, decode_state) = self
+            .runtime
+            .forward_hidden_states_with_decode_state(embedded)?;
+        let final_hidden = self.runtime.final_hidden_tensor(&hidden_states)?;
+        let state = Arc::new(PromptPrefillState {
+            final_hidden,
+            decode_state,
+        });
+        self.prompt_prefill_cache
+            .lock()
+            .map_err(|_| eyre::eyre!("Prompt prefill cache mutex was poisoned"))?
+            .insert(prompt_token_ids.to_vec(), state.clone());
+        Ok(state)
+    }
+
+    fn score_continuation_from_cached_prompt(
+        &self,
+        prompt_token_ids: &[u32],
+        candidate_token_ids: &[u32],
+    ) -> eyre::Result<BurnTextContinuationScore> {
+        let state = self.prompt_prefill_state(prompt_token_ids)?;
+        self.runtime.score_continuation_from_prefill(
+            state.final_hidden.clone(),
+            state.decode_state.clone(),
+            candidate_token_ids,
+        )
+    }
 }
 
 /// Generate with a retained CUDA runtime.
@@ -3881,9 +4034,7 @@ pub fn score_continuation_with_cached_burn_text_runtime(
     candidate_token_ids: &[u32],
 ) -> eyre::Result<BurnTextContinuationScore> {
     verify_required_cuda_runtime()?;
-    cached_runtime
-        .runtime
-        .score_continuation(prompt_token_ids, candidate_token_ids)
+    cached_runtime.score_continuation_from_cached_prompt(prompt_token_ids, candidate_token_ids)
 }
 
 fn generate_with_burn_text_runtime_inner(
@@ -4611,6 +4762,7 @@ fn rank_top_logits(logits: Vec<f32>, top_k: usize) -> Vec<BurnTextTopToken> {
     candidates
 }
 
+#[cfg(test)]
 fn score_continuation_logits(
     logits: &[f32],
     sequence_len: usize,
@@ -4634,23 +4786,11 @@ fn score_continuation_logits(
     );
     let mut total_log_probability = 0.0_f64;
     for (candidate_index, token_id) in candidate_token_ids.iter().copied().enumerate() {
-        let token_id = usize::try_from(token_id)
-            .map_err(|_| eyre::eyre!("Candidate token id exceeded usize range"))?;
-        ensure!(
-            token_id < vocab_size,
-            "Candidate token id {token_id} exceeded vocabulary size {vocab_size}"
-        );
         let row_start = (prompt_token_count - 1 + candidate_index)
             .checked_mul(vocab_size)
             .ok_or_else(|| eyre::eyre!("Continuation logits row offset overflow"))?;
         let row = &logits[row_start..row_start + vocab_size];
-        let max_logit = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-        let normalizer = row
-            .iter()
-            .map(|logit| ((*logit as f64) - max_logit).exp())
-            .sum::<f64>()
-            .ln();
-        total_log_probability += row[token_id] as f64 - max_logit - normalizer;
+        total_log_probability += log_probability_for_token(row, vocab_size, token_id)?;
     }
     let token_count = candidate_token_ids.len();
     let mean_log_probability = total_log_probability / token_count as f64;
@@ -4662,6 +4802,31 @@ fn score_continuation_logits(
         mean_negative_log_likelihood,
         perplexity: mean_negative_log_likelihood.exp(),
     })
+}
+
+fn log_probability_for_token(
+    logits: &[f32],
+    vocab_size: usize,
+    token_id: u32,
+) -> eyre::Result<f64> {
+    ensure!(
+        logits.len() == vocab_size,
+        "Single-token logits length {} did not match vocabulary size {vocab_size}",
+        logits.len()
+    );
+    let token_id = usize::try_from(token_id)
+        .map_err(|_| eyre::eyre!("Candidate token id exceeded usize range"))?;
+    ensure!(
+        token_id < vocab_size,
+        "Candidate token id {token_id} exceeded vocabulary size {vocab_size}"
+    );
+    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let normalizer = logits
+        .iter()
+        .map(|logit| ((*logit as f64) - max_logit).exp())
+        .sum::<f64>()
+        .ln();
+    Ok(logits[token_id] as f64 - max_logit - normalizer)
 }
 
 fn emit_generated_token(
@@ -6125,11 +6290,12 @@ fn softplus_scalar(value: f32) -> f32 {
 mod tests {
     use super::{
         BURN_TEXT_DIR_NAME, BURN_TEXT_MANIFEST_FILE_NAME, BurnTextManifest, BurnTextTensorSpec,
-        CancellationToken, LlmCpuBackend, REQUIRED_CUDA_MIN_DRIVER_MAJOR_VERSION,
-        REQUIRED_CUDA_NVRTC_BUILTINS_DLL_NAME, REQUIRED_CUDA_NVRTC_DLL_NAME,
-        SOURCE_SAFETENSORS_INDEX_FILE_NAME, apply_rotary_slice, bytes_per_element, causal_mask,
-        check_generation_cancellation, cuda_runtime_version_is_compatible, decode_bytes_into_f32,
-        dot_product, export_burn_text_weights, f16_bits_to_f32, first_mismatch_index,
+        CancellationToken, LlmCpuBackend, PromptPrefillCache,
+        REQUIRED_CUDA_MIN_DRIVER_MAJOR_VERSION, REQUIRED_CUDA_NVRTC_BUILTINS_DLL_NAME,
+        REQUIRED_CUDA_NVRTC_DLL_NAME, SOURCE_SAFETENSORS_INDEX_FILE_NAME, apply_rotary_slice,
+        bytes_per_element, causal_mask, check_generation_cancellation,
+        cuda_runtime_version_is_compatible, decode_bytes_into_f32, dot_product,
+        export_burn_text_weights, f16_bits_to_f32, first_mismatch_index,
         fuse_linear_attention_projection_weights, inspect_burn_text_runtime_status,
         is_generation_cancelled_error, linear_forward_3d, parse_nvidia_driver_major,
         parse_nvidia_smi_cuda_version, qwen_rms_norm, qwen_rms_norm_tensor, rank_top_logits,
@@ -6143,8 +6309,22 @@ mod tests {
     };
     use burn::tensor::{Tensor, TensorData};
     use safetensors::{Dtype, serialize_to_file, tensor::TensorView};
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, sync::Arc};
     use tokenizers::{Tokenizer, models::bpe::BPE};
+
+    #[test]
+    fn prompt_prefill_cache_evicts_the_least_recently_used_prompt() {
+        let mut cache = PromptPrefillCache::<usize>::new(2);
+        cache.insert(vec![1], Arc::new(10));
+        cache.insert(vec![2], Arc::new(20));
+        assert_eq!(cache.get(&[1]).as_deref(), Some(&10));
+
+        cache.insert(vec![3], Arc::new(30));
+
+        assert_eq!(cache.get(&[1]).as_deref(), Some(&10));
+        assert!(cache.get(&[2]).is_none());
+        assert_eq!(cache.get(&[3]).as_deref(), Some(&30));
+    }
 
     #[test]
     fn burn_text_status_reports_manifest_presence() {
