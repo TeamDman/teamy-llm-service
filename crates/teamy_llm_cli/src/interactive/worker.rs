@@ -14,17 +14,17 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::protocol::{
-    PROTOCOL_VERSION, WorkerAction, WorkerCommand, WorkerEvent, WorkerReply, encode_reply,
-    parse_command, read_frame,
+    DecisionConfig, PROTOCOL_VERSION, WorkerAction, WorkerCommand, WorkerEvent, WorkerReply,
+    encode_reply, parse_command, read_frame,
 };
-use crate::cli::decide::{DecideCli, DecisionEngine};
+use crate::cli::decide::DecisionEngine;
 
 pub async fn run_worker(service: TeamyLlmService, cancellation: CancellationToken) -> Result<()> {
     run_worker_with_io(service, cancellation, io::stdin(), io::stdout()).await
 }
 
 struct ResidentDecision {
-    config: DecideCli,
+    config: DecisionConfig,
     engine: DecisionEngine,
     // Native/ONNX providers retain this token when first loaded. It must remain
     // the same across successful requests; cancellation discards the provider.
@@ -307,7 +307,7 @@ fn run_job<W: Write>(
                 resident.config != config || resident.cancellation.is_cancelled()
             }) {
                 state.decision = None;
-                let engine = DecisionEngine::new(config.clone())?;
+                let engine = DecisionEngine::new(config.clone().into_cli()?)?;
                 state.decision = Some(ResidentDecision {
                     config,
                     engine,
@@ -522,7 +522,7 @@ mod tests {
             panic!("decide command")
         };
         let action = WorkerAction::Decide {
-            config,
+            config: DecisionConfig::try_from(&config).unwrap(),
             request_json: "{\"version\":2}".into(),
         };
         let token = CancellationToken::new();

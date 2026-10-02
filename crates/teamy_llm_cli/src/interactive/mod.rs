@@ -73,8 +73,8 @@ fn prompt_request(
     )
 }
 
-fn decision_config(args: &InteractiveCli) -> Result<DecideCli> {
-    DecideCli::for_interactive(args)
+fn decision_config(args: &InteractiveCli) -> Result<protocol::DecisionConfig> {
+    protocol::DecisionConfig::try_from(&DecideCli::for_interactive(args)?)
 }
 
 async fn wait_cancelled(cancellation: &CancellationToken) {
