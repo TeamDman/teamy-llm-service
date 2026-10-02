@@ -1,6 +1,8 @@
 use arbitrary::Arbitrary;
 use facet::Facet;
 
+pub mod finite_choice;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Facet, Arbitrary)]
 #[facet(rename_all = "kebab-case")]
 pub struct ModelSelector {

@@ -19,12 +19,17 @@ use teamy_llm_burn_qwen35::model::{
     render_model_report, resolve_llm_model_dir,
 };
 use teamy_llm_burn_qwen35::paths::{AppHome, CacheHome};
-use teamy_llm_burn_qwen35::runtime::{render_qwen_single_turn_prompt, tokenize_rendered_prompt};
+use teamy_llm_burn_qwen35::runtime::render_qwen_single_turn_prompt;
 use teamy_llm_core::{
     GenerateEvent, GenerateRequest, GenerateResult, ModelLocationStatus, ModelPreparationState,
     ModelReport, ModelSelector, ModelStatus, PrepareEvent, PrepareModelRequest, PrepareModelResult,
     ServiceError, ServiceErrorKind, ServiceHealth, ThinkingMode,
 };
+pub use teamy_llm_makepad_gguf::ORCA_MODEL_NAME;
+use teamy_llm_makepad_gguf::{GgufGenerationOptions, GgufLoadOptions, GgufRuntime};
+
+mod qwen_chat;
+mod tokenizer_cache;
 
 pub trait GenerateEventSink {
     fn send(&mut self, event: GenerateEvent) -> Result<(), ServiceError>;
@@ -106,6 +111,11 @@ pub struct TeamyLlmService {
     cache_home: CacheHome,
     inspected_models: Arc<Mutex<HashMap<PathBuf, LlmModelArtifacts>>>,
     cached_burn_runtimes: Arc<Mutex<HashMap<PathBuf, Arc<CachedBurnTextCudaRuntime>>>>,
+    cached_gguf_runtimes: Arc<Mutex<HashMap<PathBuf, Arc<GgufRuntime>>>>,
+    cached_tokenizers: tokenizer_cache::TokenizerCache,
+    // A 24 GB device cannot retain both the legacy FP16 and 27B Q4 models at once.
+    // Serialize service GPU work, and release the other backend when selection changes.
+    gpu_queue: Arc<Mutex<()>>,
     generation_queues: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
 }
 
@@ -116,6 +126,9 @@ impl TeamyLlmService {
             cache_home,
             inspected_models: Arc::new(Mutex::new(HashMap::new())),
             cached_burn_runtimes: Arc::new(Mutex::new(HashMap::new())),
+            cached_gguf_runtimes: Arc::new(Mutex::new(HashMap::new())),
+            cached_tokenizers: tokenizer_cache::TokenizerCache::default(),
+            gpu_queue: Arc::new(Mutex::new(())),
             generation_queues: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -131,7 +144,7 @@ impl TeamyLlmService {
         ServiceHealth {
             service_name: "teamy-llm-service".to_owned(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
-            backend: "burn-qwen35".to_owned(),
+            backend: "burn-qwen35,makepad-gguf-cuda".to_owned(),
             ready: true,
         }
     }
@@ -177,6 +190,35 @@ impl TeamyLlmService {
         )
         .await
         .map_err(map_internal_error)?;
+        self.cached_tokenizers
+            .invalidate(&prepared.artifacts.tokenizer_path)
+            .map_err(map_internal_error)?;
+        // Preparation changed the files even if a later observer or export fails.
+        // Publish the new artifact snapshot and discard resident runtimes before callbacks.
+        self.inspected_models
+            .lock()
+            .map_err(|_| {
+                ServiceError::new(ServiceErrorKind::Internal, "model cache mutex poisoned")
+            })?
+            .insert(prepared.artifacts.root.clone(), prepared.artifacts.clone());
+        self.cached_burn_runtimes
+            .lock()
+            .map_err(|_| {
+                ServiceError::new(
+                    ServiceErrorKind::Internal,
+                    "Burn runtime cache mutex poisoned",
+                )
+            })?
+            .remove(&prepared.artifacts.root);
+        self.cached_gguf_runtimes
+            .lock()
+            .map_err(|_| {
+                ServiceError::new(
+                    ServiceErrorKind::Internal,
+                    "GGUF runtime cache mutex poisoned",
+                )
+            })?
+            .remove(&prepared.artifacts.root);
         events(PrepareEvent::ModelPrepared {
             model_dir: prepared.managed_dir.display().to_string(),
         })?;
@@ -198,21 +240,6 @@ impl TeamyLlmService {
             .map_err(map_internal_error)?;
             events(PrepareEvent::BurnTextExportCompleted { message })?;
         }
-        self.inspected_models
-            .lock()
-            .map_err(|_| {
-                ServiceError::new(ServiceErrorKind::Internal, "model cache mutex poisoned")
-            })?
-            .insert(prepared.artifacts.root.clone(), prepared.artifacts.clone());
-        self.cached_burn_runtimes
-            .lock()
-            .map_err(|_| {
-                ServiceError::new(
-                    ServiceErrorKind::Internal,
-                    "Burn runtime cache mutex poisoned",
-                )
-            })?
-            .remove(&prepared.artifacts.root);
         let model_dir = prepared.managed_dir.display().to_string();
         events(PrepareEvent::Completed {
             model_dir: model_dir.clone(),
@@ -236,6 +263,7 @@ impl TeamyLlmService {
         self.generate_with_cancellation(request, None, sink)
     }
 
+    #[tracing::instrument(level = "info", name = "llm_generate", skip_all)]
     pub fn generate_with_cancellation(
         &self,
         request: GenerateRequest,
@@ -243,21 +271,37 @@ impl TeamyLlmService {
         sink: &mut impl GenerateEventSink,
     ) -> Result<GenerateResult, ServiceError> {
         check_cancelled(cancellation_token.as_ref())?;
-        verify_required_cuda_runtime().map_err(map_generation_error)?;
+        if request.max_new_tokens == 0 || request.timeout_ms == Some(0) {
+            return Err(ServiceError::new(
+                ServiceErrorKind::InvalidRequest,
+                "Generation token limit and timeout must be greater than zero",
+            ));
+        }
+        let _gpu_guard = self.lock_gpu_queue(cancellation_token.as_ref())?;
         check_cancelled(cancellation_token.as_ref())?;
         let model_dir = self.resolve_model_dir(&request.selector)?;
         check_cancelled(cancellation_token.as_ref())?;
         let queue = self.queue_for_model(&model_dir)?;
-        let _queue_guard = queue.lock().map_err(|_| {
-            ServiceError::new(
-                ServiceErrorKind::Internal,
-                "model generation queue mutex poisoned",
-            )
-        })?;
+        let _queue_guard = {
+            let _span = tracing::info_span!("llm_wait_model_queue").entered();
+            queue.lock().map_err(|_| {
+                ServiceError::new(
+                    ServiceErrorKind::Internal,
+                    "model generation queue mutex poisoned",
+                )
+            })?
+        };
 
         check_cancelled(cancellation_token.as_ref())?;
         let artifacts = self.inspect_artifacts(&model_dir)?;
         check_cancelled(cancellation_token.as_ref())?;
+        if artifacts.metadata.model_name == ORCA_MODEL_NAME {
+            return self.generate_gguf(request, cancellation_token, &artifacts, sink);
+        }
+        {
+            let _span = tracing::info_span!("llm_cuda_preflight").entered();
+            verify_required_cuda_runtime().map_err(map_generation_error)?;
+        }
         let burn_support = inspect_burn_runtime_support(&artifacts).map_err(map_internal_error)?;
         if burn_support.state != BurnLlmSupportState::Ready {
             return Err(ServiceError::new(
@@ -280,8 +324,11 @@ impl TeamyLlmService {
         sink.send(GenerateEvent::RenderedPrompt {
             prompt: rendered.prompt.clone(),
         })?;
-        let token_ids = tokenize_rendered_prompt(&artifacts.tokenizer_path, &rendered.prompt)
-            .map_err(map_invalid_request_error)?;
+        let token_ids = {
+            let _span = tracing::info_span!("llm_tokenize").entered();
+            self.tokenize_prompt(&artifacts.tokenizer_path, &rendered.prompt)?
+        };
+        tracing::debug!(prompt_tokens = token_ids.len(), "prompt tokenized");
         check_cancelled(cancellation_token.as_ref())?;
         let cached_runtime = self.cached_burn_runtime(&artifacts)?;
         check_cancelled(cancellation_token.as_ref())?;
@@ -317,6 +364,7 @@ impl TeamyLlmService {
         &self,
         request: TopTokensRequest,
     ) -> Result<TopTokensResult, ServiceError> {
+        let _gpu_guard = self.lock_gpu_queue(None)?;
         if request.top_k == 0 {
             return Err(ServiceError::new(
                 ServiceErrorKind::InvalidRequest,
@@ -370,8 +418,7 @@ impl TeamyLlmService {
                 )
                 .prompt
             };
-            let token_ids = tokenize_rendered_prompt(&artifacts.tokenizer_path, &rendered_prompt)
-                .map_err(map_invalid_request_error)?;
+            let token_ids = self.tokenize_prompt(&artifacts.tokenizer_path, &rendered_prompt)?;
             (rendered_prompt, token_ids)
         };
         let cached_runtime = self.cached_burn_runtime(&artifacts)?;
@@ -381,8 +428,10 @@ impl TeamyLlmService {
             request.top_k,
         )
         .map_err(map_generation_error)?;
-        let tokenizer = tokenizers::Tokenizer::from_file(&artifacts.tokenizer_path)
-            .map_err(|error| ServiceError::new(ServiceErrorKind::Internal, error.to_string()))?;
+        let tokenizer = self
+            .cached_tokenizers
+            .get(&artifacts.tokenizer_path)
+            .map_err(map_invalid_request_error)?;
         let top_tokens = candidates
             .into_iter()
             .map(|candidate| {
@@ -415,6 +464,7 @@ impl TeamyLlmService {
         &self,
         request: RankContinuationsRequest,
     ) -> Result<RankContinuationsResult, ServiceError> {
+        let _gpu_guard = self.lock_gpu_queue(None)?;
         if request.candidates.is_empty() {
             return Err(ServiceError::new(
                 ServiceErrorKind::InvalidRequest,
@@ -459,11 +509,11 @@ impl TeamyLlmService {
             )
             .prompt
         };
-        let prompt_token_ids =
-            tokenize_rendered_prompt(&artifacts.tokenizer_path, &rendered_prompt)
-                .map_err(map_invalid_request_error)?;
-        let tokenizer = tokenizers::Tokenizer::from_file(&artifacts.tokenizer_path)
-            .map_err(|error| ServiceError::new(ServiceErrorKind::Internal, error.to_string()))?;
+        let prompt_token_ids = self.tokenize_prompt(&artifacts.tokenizer_path, &rendered_prompt)?;
+        let tokenizer = self
+            .cached_tokenizers
+            .get(&artifacts.tokenizer_path)
+            .map_err(map_invalid_request_error)?;
         let cached_runtime = self.cached_burn_runtime(&artifacts)?;
         let mut rankings = Vec::with_capacity(request.candidates.len());
         for candidate in request.candidates {
@@ -517,10 +567,172 @@ impl TeamyLlmService {
         .map_err(map_internal_error)
     }
 
+    fn lock_gpu_queue(
+        &self,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, ServiceError> {
+        let _span = tracing::info_span!("llm_wait_gpu_queue").entered();
+        loop {
+            check_cancelled(cancellation)?;
+            match self.gpu_queue.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(ServiceError::new(
+                        ServiceErrorKind::Internal,
+                        "GPU queue mutex poisoned",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn generate_gguf(
+        &self,
+        request: GenerateRequest,
+        cancellation: Option<CancellationToken>,
+        artifacts: &LlmModelArtifacts,
+        sink: &mut impl GenerateEventSink,
+    ) -> Result<GenerateResult, ServiceError> {
+        let load_options = GgufLoadOptions::orca_qwen_q4(artifacts.model_path.clone());
+        sink.send(GenerateEvent::Started {
+            model_dir: artifacts.root.display().to_string(),
+        })?;
+        let rendered = qwen_chat::render_orca_qwen_single_turn_prompt(
+            request.system_prompt.as_deref(),
+            &request.user_prompt,
+            request.thinking_mode,
+        );
+        let mut generation_options = GgufGenerationOptions {
+            max_new_tokens: request.max_new_tokens,
+            timeout: request.timeout_ms.map(Duration::from_millis),
+            cancellation: cancellation.clone(),
+            ..Default::default()
+        };
+        generation_options
+            .validate(&rendered)
+            .map_err(map_invalid_request_error)?;
+        sink.send(GenerateEvent::RenderedPrompt {
+            prompt: rendered.clone(),
+        })?;
+        let expected_prompt_token_ids: Vec<usize> = {
+            let _span =
+                tracing::info_span!("llm_tokenize", provider = "makepad-gguf-cuda").entered();
+            self.tokenize_prompt(&artifacts.tokenizer_path, &rendered)?
+                .into_iter()
+                .map(|id| id as usize)
+                .collect()
+        };
+        if expected_prompt_token_ids
+            .len()
+            .checked_add(request.max_new_tokens)
+            .is_none_or(|total| total > load_options.max_context as usize)
+        {
+            return Err(ServiceError::new(
+                ServiceErrorKind::InvalidRequest,
+                format!(
+                    "Prompt plus requested generation exceeds this adapter's {}-token context; reduce --max-new-tokens",
+                    load_options.max_context
+                ),
+            ));
+        }
+        generation_options.expected_prompt_token_ids = Some(expected_prompt_token_ids);
+        // The global GPU guard held by our caller keeps cache replacement and generation serial.
+        self.cached_burn_runtimes
+            .lock()
+            .map_err(|_| {
+                ServiceError::new(
+                    ServiceErrorKind::Internal,
+                    "Burn runtime cache mutex poisoned",
+                )
+            })?
+            .clear();
+        let runtime = {
+            let mut runtimes = self.cached_gguf_runtimes.lock().map_err(|_| {
+                ServiceError::new(
+                    ServiceErrorKind::Internal,
+                    "GGUF runtime cache mutex poisoned",
+                )
+            })?;
+            runtimes.retain(|root, _| root == &artifacts.root);
+            if let Some(runtime) = runtimes.get(&artifacts.root) {
+                tracing::debug!(provider = "makepad-gguf-cuda", "reusing resident model");
+                runtime.clone()
+            } else {
+                let _span = tracing::info_span!("llm_load_runtime", provider = "makepad-gguf-cuda")
+                    .entered();
+                let loaded = Arc::new(
+                    GgufRuntime::load(load_options, cancellation.clone().unwrap_or_default())
+                        .map_err(map_generation_error)?,
+                );
+                let audit = loaded.audit();
+                tracing::info!(device = %audit.actual_device_name, model_bytes = audit.model_bytes,
+                    load_ms = audit.load_ms, quantized = audit.quantized_weight_residency,
+                    source_revision = %audit.source_revision, "resident GGUF model loaded");
+                runtimes.insert(artifacts.root.clone(), loaded.clone());
+                loaded
+            }
+        };
+        let report = runtime
+            .generate_with_events(&rendered, generation_options, &mut |token_id, text| {
+                sink.send(GenerateEvent::Token {
+                    token_id,
+                    text: text.to_owned(),
+                })
+                .map_err(|error| eyre::eyre!(error.to_string()))
+            })
+            .map_err(map_generation_error)?;
+        tracing::info!(prompt_tokens = report.prompt_token_count,
+            generated_tokens = report.generated_token_ids.len(), prefill_ms = report.prefill_ms,
+            decode_ms = report.decode_ms, stop_reason = %report.stop_reason, "GGUF generation completed");
+        sink.send(GenerateEvent::Completed {
+            generated_text: report.generated_text.clone(),
+        })?;
+        Ok(GenerateResult {
+            rendered_prompt: rendered,
+            generated_token_ids: report.generated_token_ids,
+            generated_text: report.generated_text,
+        })
+    }
+
+    fn tokenize_prompt(&self, path: &Path, prompt: &str) -> Result<Vec<u32>, ServiceError> {
+        let tokenizer = self
+            .cached_tokenizers
+            .get(path)
+            .map_err(map_invalid_request_error)?;
+        let encoded = tokenizer.encode(prompt, true).map_err(|error| {
+            ServiceError::new(
+                ServiceErrorKind::InvalidRequest,
+                format!("Failed to tokenize rendered prompt: {error}"),
+            )
+        })?;
+        Ok(encoded.get_ids().to_vec())
+    }
+
     fn cached_burn_runtime(
         &self,
         artifacts: &LlmModelArtifacts,
     ) -> Result<Arc<CachedBurnTextCudaRuntime>, ServiceError> {
+        self.cached_gguf_runtimes
+            .lock()
+            .map_err(|_| {
+                ServiceError::new(
+                    ServiceErrorKind::Internal,
+                    "GGUF runtime cache mutex poisoned",
+                )
+            })?
+            .clear();
+        self.cached_burn_runtimes
+            .lock()
+            .map_err(|_| {
+                ServiceError::new(
+                    ServiceErrorKind::Internal,
+                    "Burn runtime cache mutex poisoned",
+                )
+            })?
+            .retain(|root, _| root == &artifacts.root);
         let cached = self
             .cached_burn_runtimes
             .lock()
@@ -537,6 +749,7 @@ impl TeamyLlmService {
             return Ok(cached);
         }
 
+        let _span = tracing::info_span!("llm_load_runtime").entered();
         tracing::info!(model_dir = %artifacts.root.display(), "loading Burn CUDA runtime into service cache");
         let loaded =
             Arc::new(load_cached_burn_text_cuda_runtime(artifacts).map_err(map_generation_error)?);
@@ -646,9 +859,12 @@ fn map_internal_error(error: eyre::Report) -> ServiceError {
 }
 
 fn map_generation_error(error: eyre::Report) -> ServiceError {
-    if is_generation_timeout_error(&error) {
+    if is_generation_timeout_error(&error)
+        || teamy_llm_makepad_gguf::is_generation_timeout_error(&error)
+    {
         ServiceError::new(ServiceErrorKind::Timeout, error.to_string())
     } else if is_generation_cancelled_error(&error)
+        || teamy_llm_makepad_gguf::is_generation_cancelled_error(&error)
         || error.to_string().contains("Cancelled")
         || error.to_string().contains("cancelled")
     {
@@ -666,6 +882,64 @@ pub fn default_prepare_request(model: Option<String>) -> PrepareModelRequest {
         export_burn_text: false,
         burn_text_dtype: None,
         download_main_model_file: true,
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    #[test]
+    fn invalid_generation_bounds_fail_before_model_or_gpu_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = TeamyLlmService::new(
+            AppHome(temp.path().join("app")),
+            CacheHome(temp.path().join("cache")),
+        );
+        for (max_new_tokens, timeout_ms) in [(0, None), (1, Some(0))] {
+            let request = GenerateRequest {
+                selector: ModelSelector::default(),
+                system_prompt: None,
+                user_prompt: "Synthetic prompt".into(),
+                thinking_mode: ThinkingMode::Direct,
+                max_new_tokens,
+                timeout_ms,
+            };
+            let error = service
+                .generate(request, &mut |_| {
+                    panic!("Invalid request reached model events")
+                })
+                .unwrap_err();
+            assert_eq!(error.kind, ServiceErrorKind::InvalidRequest);
+        }
+        assert!(!temp.path().join("app").exists());
+        assert!(!temp.path().join("cache").exists());
+    }
+    #[test]
+    fn waiting_request_cancels_without_waiting_for_another_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = TeamyLlmService::new(
+            AppHome(temp.path().join("app")),
+            CacheHome(temp.path().join("cache")),
+        );
+        let guard = service.lock_gpu_queue(None).unwrap();
+        let cancellation = CancellationToken::new();
+        let queued_service = service.clone();
+        let queued_token = cancellation.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiting = std::thread::spawn(move || {
+            let result = queued_service.lock_gpu_queue(Some(&queued_token)).map(drop);
+            sender.send(result).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(40));
+        cancellation.request_cancel("queue test");
+        let outcome = receiver.recv_timeout(Duration::from_secs(1));
+        // Always release before asserting, including the failure case, to avoid hanging this test.
+        drop(guard);
+        waiting.join().unwrap();
+        assert_eq!(
+            outcome.unwrap().unwrap_err().kind,
+            ServiceErrorKind::Cancelled
+        );
     }
 }
 

@@ -2,7 +2,7 @@ use facet::Facet;
 use std::collections::BTreeMap;
 
 use crate::burn_text::inspect_burn_text_runtime_status;
-use crate::model::LlmModelArtifacts;
+use crate::model::{LlmModelArtifacts, ORCA_QWEN_MODEL_NAME};
 use crate::source_config::load_llm_source_config_summary;
 
 #[repr(u8)]
@@ -37,7 +37,11 @@ pub fn inspect_burn_runtime_support(
     let layer_type_histogram = source_config.text_layer_type_counts.clone();
     let burn_text_status = inspect_burn_text_runtime_status(&artifacts.root);
 
-    let (state, reason) = match text_model_type.as_deref() {
+    let (state, reason) = if artifacts.metadata.model_name == ORCA_QWEN_MODEL_NAME {
+        (BurnLlmSupportState::InventoryOnly,
+            "This Q4 GGUF is routed to the separate Makepad native CUDA adapter. Artifact presence does not establish runtime readiness; Burn's converted FP16 bundle does not execute this GGUF quantization.".to_string())
+    } else {
+        match text_model_type.as_deref() {
         Some("qwen3_5_text") if burn_text_status.exists => (
             BurnLlmSupportState::Ready,
             format!(
@@ -62,6 +66,7 @@ pub fn inspect_burn_runtime_support(
             BurnLlmSupportState::InventoryOnly,
             "Teamy could not find a text-model subtype in the captured Hugging Face config, so Burn runtime support remains inventory-only.".to_owned(),
         ),
+    }
     };
 
     Ok(BurnLlmRuntimeSupportReport {

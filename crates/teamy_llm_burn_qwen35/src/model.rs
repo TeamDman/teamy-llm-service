@@ -24,6 +24,10 @@ pub const TOKENIZER_CONFIG_FILE_NAME: &str = "tokenizer_config.json";
 pub const HF_CONFIG_FILE_NAME: &str = "config.json";
 pub const MODEL_METADATA_FILE_NAME: &str = "model-metadata.json";
 pub const DEFAULT_LLM_MODEL_NAME: &str = "qwopus-3.5-9b-coder-q4-k-m";
+pub const ORCA_QWEN_MODEL_NAME: &str = "qwen3.8-27b-uncensored-q4-k-m";
+pub const ORCA_QWEN_GGUF_FILE: &str = "Qwen3.8-27B-Uncensored-Q4_K_M.gguf";
+pub const ORCA_QWEN_GGUF_REVISION: &str = "fc437a3374c9977bdc339a8ec106dcd9a0357001";
+pub const ORCA_QWEN_SOURCE_REVISION: &str = "8cb32d72080f6a47bf34dc5adf8067daa6c63a31";
 const BURN_TEXT_ONLY_MODEL_PLACEHOLDER: &str = "This placeholder marks a Teamy Burn-text-only model directory. The Rust runtime uses the converted burn-text bundle rather than this GGUF file.\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,21 +47,39 @@ pub struct KnownLlmModel {
     pub supports_tool_calling: bool,
 }
 
-pub const KNOWN_LLM_MODELS: [KnownLlmModel; 1] = [KnownLlmModel {
-    name: DEFAULT_LLM_MODEL_NAME,
-    family: "qwopus",
-    display_name: "Jackrong/Qwopus3.5-9B-Coder-GGUF (Q4_K_M)",
-    source_repo_id: "Jackrong/Qwopus3.5-9B-Coder",
-    model_repo_id: "Jackrong/Qwopus3.5-9B-Coder-GGUF",
-    tokenizer_repo_id: "Jackrong/Qwopus3.5-9B-Coder",
-    architecture: "qwen35",
-    quantization: "Q4_K_M",
-    model_file_name: "Qwopus3.5-9B-coder-Exp-Q4_K_M.gguf",
-    parameter_count: "9B",
-    size_estimate: "5.63 GiB",
-    supports_vision: true,
-    supports_tool_calling: true,
-}];
+pub const KNOWN_LLM_MODELS: [KnownLlmModel; 2] = [
+    KnownLlmModel {
+        name: DEFAULT_LLM_MODEL_NAME,
+        family: "qwopus",
+        display_name: "Jackrong/Qwopus3.5-9B-Coder-GGUF (Q4_K_M)",
+        source_repo_id: "Jackrong/Qwopus3.5-9B-Coder",
+        model_repo_id: "Jackrong/Qwopus3.5-9B-Coder-GGUF",
+        tokenizer_repo_id: "Jackrong/Qwopus3.5-9B-Coder",
+        architecture: "qwen35",
+        quantization: "Q4_K_M",
+        model_file_name: "Qwopus3.5-9B-coder-Exp-Q4_K_M.gguf",
+        parameter_count: "9B",
+        size_estimate: "5.63 GiB",
+        supports_vision: true,
+        supports_tool_calling: true,
+    },
+    KnownLlmModel {
+        name: ORCA_QWEN_MODEL_NAME,
+        family: "qwen3.8",
+        display_name: "OrcaRouter/Qwen3.8-27B-Uncensored-GGUF (Q4_K_M)",
+        source_repo_id: "orcarouter/Qwen3.8-27B-Uncensored",
+        model_repo_id: "orcarouter/Qwen3.8-27B-Uncensored-GGUF",
+        tokenizer_repo_id: "orcarouter/Qwen3.8-27B-Uncensored",
+        architecture: "qwen35",
+        quantization: "Q4_K_M",
+        model_file_name: ORCA_QWEN_GGUF_FILE,
+        parameter_count: "27B",
+        size_estimate: "15.66 GiB (16,810,714,496 bytes)",
+        // This runtime slice accepts text only; the upstream model's vision tower is separate.
+        supports_vision: false,
+        supports_tool_calling: false,
+    },
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LlmModelPreparationState {
@@ -173,6 +195,12 @@ pub fn managed_model_dir(cache_home: &CacheHome, model_name: &str) -> PathBuf {
 
 #[must_use]
 pub fn model_file_url(known: &KnownLlmModel) -> String {
+    if known.name == ORCA_QWEN_MODEL_NAME {
+        return format!(
+            "https://huggingface.co/{}/resolve/{ORCA_QWEN_GGUF_REVISION}/{}",
+            known.model_repo_id, known.model_file_name
+        );
+    }
     hugging_face_resolve_url(known.model_repo_id, known.model_file_name)
 }
 
@@ -183,16 +211,34 @@ pub fn mmproj_file_url(known: &KnownLlmModel) -> String {
 
 #[must_use]
 pub fn tokenizer_file_url(known: &KnownLlmModel) -> String {
+    if known.name == ORCA_QWEN_MODEL_NAME {
+        return format!(
+            "https://huggingface.co/{}/resolve/{ORCA_QWEN_SOURCE_REVISION}/{TOKENIZER_FILE_NAME}",
+            known.tokenizer_repo_id
+        );
+    }
     hugging_face_resolve_url(known.tokenizer_repo_id, TOKENIZER_FILE_NAME)
 }
 
 #[must_use]
 pub fn tokenizer_config_file_url(known: &KnownLlmModel) -> String {
+    if known.name == ORCA_QWEN_MODEL_NAME {
+        return format!(
+            "https://huggingface.co/{}/resolve/{ORCA_QWEN_SOURCE_REVISION}/{TOKENIZER_CONFIG_FILE_NAME}",
+            known.tokenizer_repo_id
+        );
+    }
     hugging_face_resolve_url(known.tokenizer_repo_id, TOKENIZER_CONFIG_FILE_NAME)
 }
 
 #[must_use]
 pub fn hf_config_file_url(known: &KnownLlmModel) -> String {
+    if known.name == ORCA_QWEN_MODEL_NAME {
+        return format!(
+            "https://huggingface.co/{}/resolve/{ORCA_QWEN_SOURCE_REVISION}/{HF_CONFIG_FILE_NAME}",
+            known.source_repo_id
+        );
+    }
     hugging_face_resolve_url(known.source_repo_id, HF_CONFIG_FILE_NAME)
 }
 
@@ -208,15 +254,6 @@ pub fn hugging_face_resolve_url(repo_id: &str, file_name: &str) -> String {
 /// This function will return an error if the directory is incomplete or incompatible.
 pub fn inspect_model_dir(root: &Path) -> eyre::Result<LlmModelArtifacts> {
     ensure_existing_dir(root)?;
-
-    let model_path = root.join(MODEL_FILE_NAME);
-    if !model_path.is_file() {
-        bail!(
-            "LLM model directory is missing {}: {}",
-            MODEL_FILE_NAME,
-            model_path.display()
-        );
-    }
 
     let tokenizer_path = root.join(TOKENIZER_FILE_NAME);
     if !tokenizer_path.is_file() {
@@ -269,6 +306,13 @@ pub fn inspect_model_dir(root: &Path) -> eyre::Result<LlmModelArtifacts> {
             )
         })?)
         .wrap_err_with(|| format!("Failed to parse {}", metadata_path.display()))?;
+    let model_path = declared_model_path(root, &metadata)?;
+    if !model_path.is_file() {
+        bail!(
+            "LLM model directory is missing declared model file: {}",
+            model_path.display()
+        );
+    }
 
     let mmproj_path = root.join(MMPROJ_FILE_NAME);
     let mmproj_path = if mmproj_path.is_file() {
@@ -287,6 +331,18 @@ pub fn inspect_model_dir(root: &Path) -> eyre::Result<LlmModelArtifacts> {
         metadata_path,
         metadata,
     })
+}
+
+/// Keep old Burn artifact layouts unchanged; the new GGUF adapter consumes the exact publisher
+/// filename directly. Metadata cannot select arbitrary relative paths or traverse the model root.
+fn declared_model_path(root: &Path, metadata: &LlmManagedModelMetadata) -> eyre::Result<PathBuf> {
+    if metadata.model_name == ORCA_QWEN_MODEL_NAME {
+        if metadata.model_file_name != ORCA_QWEN_GGUF_FILE {
+            bail!("Frozen Orca Qwen variant requires its exact published GGUF filename");
+        }
+        return Ok(root.join(ORCA_QWEN_GGUF_FILE));
+    }
+    Ok(root.join(MODEL_FILE_NAME))
 }
 
 #[must_use]
@@ -545,6 +601,12 @@ pub async fn prepare_known_llm_model(
         });
     }
 
+    if known.name == ORCA_QWEN_MODEL_NAME {
+        bail!(
+            "The pinned Orca Qwen GGUF must be acquired directly into its managed model directory with approved Hugging Face tooling, then inspected and registered. This first slice does not overwrite it or convert it into Burn FP16 weights."
+        );
+    }
+
     let staging_dir = managed_dir.with_extension("staging");
     remove_existing_path(&staging_dir)
         .wrap_err_with(|| format!("Failed to clear staging path {}", staging_dir.display()))?;
@@ -625,6 +687,11 @@ pub fn prepare_burn_text_runtime_bundle(
     overwrite: bool,
     dtype: Option<&str>,
 ) -> eyre::Result<String> {
+    if artifacts.metadata.model_name == ORCA_QWEN_MODEL_NAME {
+        bail!(
+            "This Orca Qwen Q4 GGUF uses the separate Makepad quantized runtime; Burn FP16 conversion is not supported for this variant"
+        );
+    }
     let manifest_path = burn_text_manifest_path(&artifacts.root);
     if manifest_path.is_file() && !overwrite {
         load_burn_text_manifest(&manifest_path).wrap_err_with(|| {
@@ -679,7 +746,8 @@ pub fn list_known_llm_model_statuses(
         .iter()
         .map(|known| {
             let managed_dir = managed_model_dir(cache_home, known.name);
-            let managed_compatible = inspect_model_dir(&managed_dir).is_ok();
+            let managed_compatible = inspect_model_dir(&managed_dir)
+                .is_ok_and(|artifacts| artifacts.metadata.model_name == known.name);
             let mut locations = vec![LlmModelLocationStatus {
                 label: "managed".to_owned(),
                 path: managed_dir.clone(),
@@ -687,12 +755,18 @@ pub fn list_known_llm_model_statuses(
                 compatible: managed_compatible,
             }];
             for path in &registered {
-                let compatible = inspect_model_dir(path).is_ok();
+                let Ok(artifacts) = inspect_model_dir(path) else {
+                    // An unreadable inventory has no verified identity to attribute to this row.
+                    continue;
+                };
+                if artifacts.metadata.model_name != known.name {
+                    continue;
+                }
                 locations.push(LlmModelLocationStatus {
                     label: "registered".to_owned(),
                     path: path.clone(),
                     exists: path.exists(),
-                    compatible,
+                    compatible: true,
                 });
             }
             let state = if managed_compatible {
@@ -812,7 +886,7 @@ fn write_registered_model_dirs(app_home: &AppHome, model_dirs: &[PathBuf]) -> ey
         .wrap_err_with(|| format!("Failed to write {}", registry_path.display()))
 }
 
-fn write_model_metadata(
+pub fn write_model_metadata(
     root: &Path,
     known: &KnownLlmModel,
     include_mmproj: bool,
@@ -1049,6 +1123,81 @@ mod tests {
             Some(MODEL_FILE_NAME)
         );
         assert!(root.join(MODEL_METADATA_FILE_NAME).is_file());
+    }
+
+    #[test]
+    fn new_gguf_layout_keeps_publisher_filename_and_rejects_metadata_traversal() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        write_model_metadata(temp.path(), &KNOWN_LLM_MODELS[1], false).unwrap();
+        let mut metadata: super::LlmManagedModelMetadata = facet_json::from_slice(
+            &std::fs::read(temp.path().join(MODEL_METADATA_FILE_NAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            super::declared_model_path(temp.path(), &metadata).unwrap(),
+            temp.path().join(super::ORCA_QWEN_GGUF_FILE)
+        );
+        metadata.model_file_name = "../outside.gguf".into();
+        assert!(super::declared_model_path(temp.path(), &metadata).is_err());
+        metadata.model_file_name = "model.gguf".into();
+        assert!(super::declared_model_path(temp.path(), &metadata).is_err());
+        let known = &KNOWN_LLM_MODELS[1];
+        assert!(super::model_file_url(known).contains(super::ORCA_QWEN_GGUF_REVISION));
+        assert!(super::tokenizer_file_url(known).contains(super::ORCA_QWEN_SOURCE_REVISION));
+    }
+
+    #[test]
+    fn registered_locations_are_attributed_only_to_their_verified_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = super::AppHome(temp.path().join("app"));
+        let cache = super::CacheHome(temp.path().join("cache"));
+        let old_root = temp.path().join("old-model");
+        let new_root = temp.path().join("new-model");
+        for (root, known) in [
+            (&old_root, &KNOWN_LLM_MODELS[0]),
+            (&new_root, &KNOWN_LLM_MODELS[1]),
+        ] {
+            std::fs::create_dir(root).unwrap();
+            let model_file = if known.name == super::ORCA_QWEN_MODEL_NAME {
+                super::ORCA_QWEN_GGUF_FILE
+            } else {
+                MODEL_FILE_NAME
+            };
+            std::fs::write(root.join(model_file), b"inventory-fixture").unwrap();
+            Tokenizer::new(BPE::default())
+                .save(root.join(TOKENIZER_FILE_NAME), false)
+                .unwrap();
+            std::fs::write(
+                root.join(TOKENIZER_CONFIG_FILE_NAME),
+                r#"{"bos_token":"<s>","eos_token":"</s>","chat_template":"template"}"#,
+            )
+            .unwrap();
+            std::fs::write(root.join(HF_CONFIG_FILE_NAME),
+                r#"{"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text","layer_types":["linear_attention","full_attention"]}}"#).unwrap();
+            write_model_metadata(root, known, false).unwrap();
+            super::add_registered_model_dir(&app, root).unwrap();
+        }
+        let unknown_root = temp.path().join("unknown-model");
+        std::fs::create_dir(&unknown_root).unwrap();
+        super::add_registered_model_dir(&app, &unknown_root).unwrap();
+        let statuses = super::list_known_llm_model_statuses(&app, &cache).unwrap();
+        for (known, expected_root) in [
+            (&KNOWN_LLM_MODELS[0], old_root),
+            (&KNOWN_LLM_MODELS[1], new_root),
+        ] {
+            let status = statuses
+                .iter()
+                .find(|status| status.model_name == known.name)
+                .unwrap();
+            let registered: Vec<_> = status
+                .locations
+                .iter()
+                .filter(|location| location.label == "registered")
+                .collect();
+            assert_eq!(registered.len(), 1);
+            assert_eq!(registered[0].path, expected_root);
+            assert!(registered[0].compatible);
+        }
     }
 
     #[test]

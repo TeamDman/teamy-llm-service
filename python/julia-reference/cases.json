@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "max_tokens": 1024,
+  "head_tokens": 256,
+  "default_question": "Which option should be chosen?",
+  "cases": [
+    {
+      "id": "two-default-question",
+      "state": "A character has low health and a healing item is available.",
+      "options": [
+        { "id": "heal", "text": "Use the healing item" },
+        { "id": "wait", "text": "Wait without healing" }
+      ]
+    },
+    {
+      "id": "three-explicit-question",
+      "state": "A file has changed locally. The working copy is not saved yet.",
+      "question": "Which action preserves the unsaved work?",
+      "options": [
+        { "id": "save", "text": "Save the local file" },
+        { "id": "discard", "text": "Discard all changes" },
+        { "id": "delete", "text": "Delete the file" }
+      ]
+    },
+    {
+      "id": "five-unicode",
+      "state": "The player says: café, naïve, snowman ☃, and 日本語.",
+      "options": [
+        { "id": "preserve", "text": "Preserve the original Unicode text" },
+        { "id": "ascii", "text": "Replace every non-ASCII character" },
+        { "id": "drop", "text": "Drop the message" },
+        { "id": "quote", "text": "Quote the message for review" },
+        { "id": "ask", "text": "Ask for more context" }
+      ]
+    },
+    {
+      "id": "twenty-short-options",
+      "state": "A task has twenty explicitly named candidate categories.",
+      "options": [
+        { "id": "c01", "text": "Category one" },
+        { "id": "c02", "text": "Category two" },
+        { "id": "c03", "text": "Category three" },
+        { "id": "c04", "text": "Category four" },
+        { "id": "c05", "text": "Category five" },
+        { "id": "c06", "text": "Category six" },
+        { "id": "c07", "text": "Category seven" },
+        { "id": "c08", "text": "Category eight" },
+        { "id": "c09", "text": "Category nine" },
+        { "id": "c10", "text": "Category ten" },
+        { "id": "c11", "text": "Category eleven" },
+        { "id": "c12", "text": "Category twelve" },
+        { "id": "c13", "text": "Category thirteen" },
+        { "id": "c14", "text": "Category fourteen" },
+        { "id": "c15", "text": "Category fifteen" },
+        { "id": "c16", "text": "Category sixteen" },
+        { "id": "c17", "text": "Category seventeen" },
+        { "id": "c18", "text": "Category eighteen" },
+        { "id": "c19", "text": "Category nineteen" },
+        { "id": "c20", "text": "Category twenty" }
+      ]
+    },
+    {
+      "id": "longer-state",
+      "state": "A repository reorganization is a plan until an operator applies it. Existing files remain at their current paths. A planned destination is only a proposal. Unknown metadata must remain unknown. A completed analysis can report conflicts without performing a move. Record the source and intended destination separately. A review can change the plan without changing the source files. Preserve file content while comparing candidate locations. A model score describes a preference, not permission to move a file. The next operation must have a defined scope and a current revision.",
+      "options": [
+        { "id": "plan", "text": "Add a proposed action to the plan" },
+        { "id": "inspect", "text": "Inspect the plan conflicts" },
+        { "id": "move", "text": "Move every source immediately" },
+        { "id": "publish", "text": "Publish the local file inventory" }
+      ]
+    },
+    {
+      "id": "same-descriptions-distinct-ids",
+      "state": "Two named options intentionally have identical descriptions.",
+      "options": [
+        { "id": "first", "text": "Keep the current state" },
+        { "id": "second", "text": "Keep the current state" }
+      ]
+    }
+  ]
+}

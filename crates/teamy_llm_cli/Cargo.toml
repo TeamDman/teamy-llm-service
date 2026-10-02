@@ -19,10 +19,18 @@ tracy = ["dep:tracing-tracy", "teamy_llm_service/tracy"]
 color-eyre.workspace = true
 eyre.workspace = true
 humantime.workspace = true
+facet.workspace = true
+facet-json.workspace = true
+teamy_llm_burn_julia.workspace = true
 teamy_llm_core.workspace = true
+teamy_llm_julia_common.workspace = true
+teamy_llm_onnx_julia.workspace = true
 teamy_llm_service = { workspace = true, features = ["vox"] }
 teamy-cancellation = { workspace = true, features = ["ctrlc", "tracing", "tracing-subscriber", "figue"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-tracy = { workspace = true, optional = true }
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

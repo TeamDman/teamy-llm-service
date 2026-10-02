@@ -3967,7 +3967,10 @@ pub fn generate_with_cached_burn_text_runtime_to_sink(
     options: &BurnTextGenerationOptions,
     sink: &mut dyn GenerationEventSink,
 ) -> eyre::Result<BurnTextGenerationReport> {
-    verify_required_cuda_runtime()?;
+    {
+        let _span = tracing::info_span!("llm_backend_cuda_preflight").entered();
+        verify_required_cuda_runtime()?;
+    }
     let mut token_sink = Some(sink);
     match burn_text_generation_mode() {
         BurnTextGenerationMode::Hybrid => {
@@ -4613,11 +4616,18 @@ fn generate_with_hybrid_burn_text_runtime_with_runtime<B: Backend>(
         "hybrid generating token 1 with prompt length {}",
         prompt_token_ids.len()
     ));
-    let (hidden_states, mut decode_state) = runtime.forward_hidden_states_with_decode_state(
-        runtime.embedding_hidden_states(prompt_token_ids)?,
-    )?;
+    let (hidden_states, mut decode_state) = {
+        let _span =
+            tracing::info_span!("llm_prefill", prompt_tokens = prompt_token_ids.len()).entered();
+        runtime.forward_hidden_states_with_decode_state(
+            runtime.embedding_hidden_states(prompt_token_ids)?,
+        )?
+    };
     trace_burn_text_runtime("hybrid decoder stack complete; scanning lm_head");
-    let first_token_id = runtime.greedy_next_token(hidden_states)?;
+    let first_token_id = {
+        let _span = tracing::info_span!("llm_first_token_projection").entered();
+        runtime.greedy_next_token(hidden_states)?
+    };
     trace_burn_text_runtime(&format!("hybrid selected token id {first_token_id}"));
     let mut generated_token_ids = vec![first_token_id];
     let mut emitted_text_len = 0_usize;
@@ -4653,6 +4663,8 @@ fn generate_with_hybrid_burn_text_runtime_with_runtime<B: Backend>(
             .wrap_err_with(|| format!("Token id {first_token_id} exceeded u32 range"))?,
     )?;
 
+    let _decode_span =
+        tracing::info_span!("llm_decode", max_new_tokens = options.max_new_tokens).entered();
     for token_index in 1..options.max_new_tokens {
         deadline.update_progress(generated_token_ids.len(), options.max_new_tokens);
         deadline.check(generated_token_ids.len(), options.max_new_tokens)?;

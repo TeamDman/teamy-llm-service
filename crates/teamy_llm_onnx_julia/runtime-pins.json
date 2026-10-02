@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "binding": "ort =2.0.0-rc.12",
+  "sys_binding": "ort-sys =2.0.0-rc.12",
+  "runtime": "1.24.2",
+  "source": "https://api.github.com/repos/microsoft/onnxruntime/releases/tags/v1.24.2",
+  "publisher": "Microsoft ONNX Runtime release",
+  "inspected_cuda_dlls": [
+    { "name": "onnxruntime.dll", "bytes": 14379552, "sha256": "6957d423fecdcbeed2a6357b10f62b66b0c7eeb1b487db95e0b24d79fda73caa" },
+    { "name": "onnxruntime_providers_cuda.dll", "bytes": 211528736, "sha256": "47f3aeb27c5bbd8d4eb45ba2908ca7e308b355cd8519835367c4c158d68140f8" },
+    { "name": "onnxruntime_providers_shared.dll", "bytes": 22048, "sha256": "66ea81850ca42bc11ccacbfc714b5458fd8ae86a2dc77f3ef4cd49d4c9d4a45e" }
+  ],
+  "direct_nvidia_imports": ["cublasLt64_13.dll", "cublas64_13.dll", "cufft64_12.dll", "cudnn64_9.dll"],
+  "import_presence_is_not_session_validation": true,
+  "packages": [
+    {
+      "target": "x86_64-pc-windows-msvc",
+      "cuda_major": 13,
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-gpu_cuda13-1.24.2.zip",
+      "bytes": 288348147,
+      "sha256": "72207a283ec9886e1968a4183636a7665c78e2154d4f4adc16e61193dd7a74f1"
+    },
+    {
+      "target": "x86_64-pc-windows-msvc",
+      "cuda_major": null,
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-1.24.2.zip",
+      "bytes": 74075355,
+      "sha256": "8e3e9c826375352e29cb2614fe44f3d7a4b0ff7b8028ad7a456af9d949a7e8b0"
+    }
+  ]
+}

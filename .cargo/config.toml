@@ -2,3 +2,7 @@
 # CubeCL/Cudarc defaults to the newest binding set when no CUDA Toolkit is present at build time.
 # Keep the compiled ABI aligned with the GPU-only CUDA 13.3 runtime required by this workspace.
 CUDARC_CUDA_VERSION = { value = "13030", force = true }
+# Never produce a successful build with Makepad's nonfunctional CUDA stubs.
+# scripts/cargo-cuda.ps1 supplies the existing toolkit root and explicit target architecture.
+MAKEPAD_GGML_REQUIRE_CUDA = { value = "1", force = true }
+MAKEPAD_GGML_NO_CUDA = { value = "0", force = true }

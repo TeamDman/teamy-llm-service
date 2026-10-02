@@ -1,0 +1,25 @@
+[package]
+name = "teamy_llm_burn_julia"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+burn.workspace = true
+eyre.workspace = true
+facet.workspace = true
+facet-json.workspace = true
+half.workspace = true
+memmap2.workspace = true
+safetensors.workspace = true
+teamy-cancellation.workspace = true
+teamy_llm_burn_qwen35.workspace = true
+teamy_llm_core.workspace = true
+teamy_llm_julia_common.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+teamy-cancellation = { workspace = true, features = ["ctrlc"] }

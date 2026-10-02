@@ -1,0 +1,9 @@
+ARG PYTHON_BASE=docker.io/library/python@sha256:9901e0a8d75037d8242ed43155cbcb2d1f61be1356383d8054afb59fd50e39c4
+ARG UV_BASE=ghcr.io/astral-sh/uv@sha256:663211e7509e89ff2172cc3ca098afb4ac63028dd065d2b047e4251127a7d47a
+FROM ${UV_BASE} AS uv
+FROM ${PYTHON_BASE}
+COPY --from=uv /uv /usr/local/bin/uv
+ENV UV_PYTHON_DOWNLOADS=0 HOME=/tmp UV_CACHE_DIR=/tmp/uv-cache
+WORKDIR /app
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/uv"]

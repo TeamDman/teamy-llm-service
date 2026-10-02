@@ -2,6 +2,10 @@
 resolver = "3"
 members = [
     "crates/teamy_llm_core",
+    "crates/teamy_llm_julia_common",
+    "crates/teamy_llm_burn_julia",
+    "crates/teamy_llm_onnx_julia",
+    "crates/teamy_llm_makepad_gguf",
     "crates/teamy_llm_burn_qwen35",
     "crates/teamy_llm_service",
     "crates/teamy_llm_cli",
@@ -15,6 +19,10 @@ repository = "https://github.com/TeamDman/teamy-llm-service"
 
 [workspace.dependencies]
 teamy_llm_core = { path = "crates/teamy_llm_core" }
+teamy_llm_julia_common = { path = "crates/teamy_llm_julia_common" }
+teamy_llm_burn_julia = { path = "crates/teamy_llm_burn_julia" }
+teamy_llm_onnx_julia = { path = "crates/teamy_llm_onnx_julia" }
+teamy_llm_makepad_gguf = { path = "crates/teamy_llm_makepad_gguf" }
 teamy_llm_burn_qwen35 = { path = "crates/teamy_llm_burn_qwen35" }
 teamy_llm_service = { path = "crates/teamy_llm_service" }
 
@@ -27,8 +35,12 @@ eyre = "0.6.12"
 half = "2.7.1"
 humantime = "2.2.0"
 memmap2 = "0.9.9"
+libloading = "=0.9.0"
+makepad-ai-llm = { git = "https://github.com/makepad/makepad", rev = "9e5e3d2b03214f8c2c37adffa0e308c815662060" }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "cuda", "api-24"] }
 reqwest = { version = "0.12.23", default-features = false, features = ["blocking", "rustls-tls", "stream"] }
 safetensors = "0.7.0"
+sha2 = "=0.10.9"
 teamy-cancellation = { git = "https://github.com/TeamDman/teamy-cancellation.git", tag = "v0.3.1", default-features = false }
 tempfile = "3.20.0"
 tokio = { version = "1.49.0", features = ["full"] }
