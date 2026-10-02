@@ -67,13 +67,27 @@ The new `qwen3.8-27b-uncensored-q4-k-m` model uses Makepad's native CUDA GGUF ex
 resident quantized weights and independent Hugging Face token-ID verification before prefill.
 The existing Qwopus Burn model and configured default are retained. This slice supports text
 prompts; it does not implement vision or tool calls for the new model.
-The Orca session has a 1,024-token context shared by the rendered prompt and requested output.
-Omitting explicit model selection warns and lists the available models.
+The Orca session defaults to an 8,192-token context shared by the formatted prompt and requested
+output. `--context-tokens` accepts 128 to 32,768 for this provider. It does not change the legacy
+Burn model's context. The service rejects a request when the formatted prompt token count plus
+`--max-new-tokens` exceeds that capacity; the error reports both counts and the selected capacity.
+It does not truncate the prompt. A capacity change replaces the resident GGUF runtime and loads
+the model again. The supported range bounds allocation; available GPU memory still limits what fits.
+Omitting explicit model selection warns with commands to inspect the default and available models.
 
 ```powershell
 teamy-llm model list
 teamy-llm prompt --model qwen3.8-27b-uncensored-q4-k-m --no-thinking --max-new-tokens 64 'Why is the sky blue?'
 teamy-llm benchmark --model qwen3.8-27b-uncensored-q4-k-m --no-thinking --repeat 3 --max-new-tokens 32 --log-level debug --log-file '<capture.ndjson>'
+```
+
+Use a solitary `-` prompt to read UTF-8 text from stdin, up to 2 MiB. The CLI preserves input
+whitespace and rejects invalid UTF-8, excess bytes and empty input. Other prompt arguments do
+not consume stdin. The byte limit is separate from the model's token capacity:
+
+```powershell
+Get-Content ./prompt.txt -Raw -Encoding utf8 | teamy-llm prompt `
+  --model qwen3.8-27b-uncensored-q4-k-m --context-tokens 8192 --max-new-tokens 64 -
 ```
 
 `--log-level` aliases `--log-filter`; `--log-file` appends NDJSON to an explicit file.
@@ -112,10 +126,38 @@ A long-lived `TeamyLlmService` also retains the default hybrid CUDA runtime per 
 first request. This reuses lazily populated GPU weight caches for later requests; preparing a model
 invalidates its cached runtime so updated weights are never reused.
 The service also caches tokenizers, reloading when file length or modification time changes.
-Runtime reuse requires the same service process; separate CLI prompt invocations remain cold.
+Runtime reuse requires the same service process. Without `--address`, each CLI prompt process
+loads its own runtime. With `--address`, fresh clients can reuse a prewarmed local service.
 Switching between Burn and GGUF drops the competing runtime objects to limit GPU memory pressure.
 Allocator-held GPU memory can outlive those drops; interactive prompt/decision mode changes use an
 owned-process replacement to release the previous backend's residency.
+
+## Resident local service
+
+Start the service in one terminal. An explicit model performs a one-token prewarm before the
+listener accepts clients. On Windows, the default address is the local named pipe shown here:
+
+```powershell
+teamy-llm serve --address 'local://\\.\pipe\teamy-llm-service' `
+  --model qwen3.8-27b-uncensored-q4-k-m --context-tokens 8192
+```
+
+Then run fresh prompt clients from another terminal:
+
+```powershell
+teamy-llm prompt --address 'local://\\.\pipe\teamy-llm-service' `
+  --model qwen3.8-27b-uncensored-q4-k-m --context-tokens 8192 `
+  --max-new-tokens 64 'Why is the sky blue?'
+Get-Content ./prompt.txt -Raw -Encoding utf8 | teamy-llm prompt `
+  --address 'local://\\.\pipe\teamy-llm-service' `
+  --model qwen3.8-27b-uncensored-q4-k-m --context-tokens 8192 --max-new-tokens 64 -
+```
+
+Keep the same model and context capacity to reuse the prewarmed runtime. A client must specify
+`--model`; this IPC mode does not accept `--model-dir`. The address uses local IPC, with no TCP
+fallback or automatic local load if connection fails. Omitting the service's model starts a
+listener that loads models on their first request. Ctrl+C cancels active generation and drains
+the service's blocking jobs before shutdown. Cancellation cannot preempt a running GPU kernel.
 
 ## Resident interactive inference
 
@@ -181,9 +223,19 @@ child job separately, excluding parent restart and transport. The first action s
 initial worker handshake, so these fields do not measure full CLI startup. The TUI currently
 starts its live busy timer after submission and reports worker duration on completion.
 
-Resident reuse does not add Windows mmap support. The pinned Makepad loader has a non-Unix
-mapping stub and uses an owned weight arena. Cold SHA-256 verification, disk staging and GPU
-session preparation remain. See the [Windows mmap explanation](https://teamdman.github.io/teamy-docs/local-text-generation.html#understand-the-windows-mmap-message).
+The vendored Makepad loader now supports a read-only Windows mapping through `memmap2`. It
+retains a file handle that excludes ordinary writes and deletion while the mapping is alive.
+CUDA still uploads weights to device memory; mapping avoids the separate owned host weight
+arena. If mapping fails, the loader reports the reason and uses its owned-arena path.
+
+Our adapter performs the full frozen SHA-256 check on each runtime load before session
+preparation. This is our identity check, rather than a Makepad requirement; resident reuse
+avoids repeating it for the same loaded runtime. Cold loading still includes verification,
+GPU upload and session preparation. The vendor changes start from Makepad revision
+`9e5e3d2b03214f8c2c37adffa0e308c815662060` and retain its numerical execution and CUDA kernels.
+Read-only sharing assumes immutable backing bytes and a stable model path; it does not protect
+against privileged mutation or path retargeting. Measure cold-start latency separately from
+fresh clients using a prewarmed service.
 
 ## Performance baseline
 
