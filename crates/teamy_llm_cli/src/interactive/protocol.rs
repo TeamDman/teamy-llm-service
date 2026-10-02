@@ -329,6 +329,7 @@ mod tests {
                     thinking_mode: ThinkingMode::Direct,
                     max_new_tokens: 4,
                     timeout_ms: None,
+                    context_tokens: None,
                 },
             },
         }

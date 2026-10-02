@@ -3852,7 +3852,6 @@ dependencies = [
 [[package]]
 name = "makepad-ai-llm"
 version = "0.1.0"
-source = "git+https://github.com/makepad/makepad?rev=9e5e3d2b03214f8c2c37adffa0e308c815662060#9e5e3d2b03214f8c2c37adffa0e308c815662060"
 dependencies = [
  "makepad-ai-cuda",
  "makepad-ai-loader",
@@ -3863,9 +3862,9 @@ dependencies = [
 [[package]]
 name = "makepad-ai-loader"
 version = "0.1.0"
-source = "git+https://github.com/makepad/makepad?rev=9e5e3d2b03214f8c2c37adffa0e308c815662060#9e5e3d2b03214f8c2c37adffa0e308c815662060"
 dependencies = [
  "makepad-micro-serde",
+ "memmap2",
 ]
 
 [[package]]
@@ -6050,8 +6049,10 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-error",
  "tracing-subscriber",
  "tracing-tracy",
+ "vox",
 ]
 
 [[package]]

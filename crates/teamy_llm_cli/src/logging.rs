@@ -125,6 +125,7 @@ pub fn install(
         None
     };
     let subscriber = Registry::default()
+        .with(tracing_error::ErrorLayer::default())
         .with(stderr)
         .with(file_layer)
         .with(stop_after.stop_after_span_layer(cancellation));

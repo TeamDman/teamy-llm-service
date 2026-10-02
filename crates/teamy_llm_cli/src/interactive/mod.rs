@@ -62,7 +62,7 @@ fn prompt_request(
     service: &TeamyLlmService,
     text: String,
 ) -> Result<GenerateRequest> {
-    crate::cli::prompt::generation_request(
+    let mut request = crate::cli::prompt::generation_request(
         service,
         &args.selection,
         args.system_prompt.clone(),
@@ -70,7 +70,9 @@ fn prompt_request(
         args.max_new_tokens,
         args.timeout_ms,
         text,
-    )
+    )?;
+    request.context_tokens = args.context_tokens;
+    Ok(request)
 }
 
 fn decision_config(args: &InteractiveCli) -> Result<protocol::DecisionConfig> {

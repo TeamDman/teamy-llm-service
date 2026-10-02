@@ -9,6 +9,8 @@ members = [
     "crates/teamy_llm_burn_qwen35",
     "crates/teamy_llm_service",
     "crates/teamy_llm_cli",
+    "vendor/makepad-ai-loader",
+    "vendor/makepad-ai-llm",
 ]
 
 [workspace.package]
@@ -36,7 +38,7 @@ half = "2.7.1"
 humantime = "2.2.0"
 memmap2 = "0.9.9"
 libloading = "=0.9.0"
-makepad-ai-llm = { git = "https://github.com/makepad/makepad", rev = "9e5e3d2b03214f8c2c37adffa0e308c815662060" }
+makepad-ai-llm = { path = "vendor/makepad-ai-llm" }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "cuda", "api-24"] }
 reqwest = { version = "0.12.23", default-features = false, features = ["blocking", "rustls-tls", "stream"] }
 safetensors = "0.7.0"
@@ -46,6 +48,7 @@ tempfile = "3.20.0"
 tokio = { version = "1.49.0", features = ["full"] }
 tokenizers = { version = "0.22.0", default-features = false, features = ["onig"] }
 tracing = "0.1.41"
+tracing-error = "=0.2.1"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 tracy-client = { version = "0.18.4", default-features = false, features = ["enable", "system-tracing", "context-switch-tracing", "sampling", "code-transfer", "callstack-inlines", "only-localhost"] }
 tracing-tracy = { version = "0.11", default-features = false, features = ["enable", "system-tracing", "context-switch-tracing", "sampling", "code-transfer", "callstack-inlines", "only-localhost"] }
@@ -59,6 +62,11 @@ vox = { git = "https://github.com/TeamDman/facet.git", rev = "d0c3140ec6683f8024
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm_0_29", "layout-cache"] }
 crossterm = { version = "=0.29.0", features = ["event-stream"] }
 futures-util = "=0.3.32"
+
+# CUDA and Metal also consume loader types. Keep one loader identity throughout
+# the pinned Makepad graph while leaving their numerical implementations intact.
+[patch."https://github.com/makepad/makepad"]
+makepad-ai-loader = { path = "vendor/makepad-ai-loader" }
 
 [profile.dev.package."*"]
 opt-level = 3

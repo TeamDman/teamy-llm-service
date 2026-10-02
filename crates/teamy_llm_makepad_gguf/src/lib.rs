@@ -4,7 +4,7 @@
 //! and token events through bounded channels; no unsafe Send/Sync implementation is needed.
 //! Cancellation observes hash/load/prefill/decode boundaries, never preempts a GPU kernel.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -26,6 +26,17 @@ pub const ORCA_GGUF_REVISION: &str = "fc437a3374c9977bdc339a8ec106dcd9a0357001";
 pub const ORCA_GGUF_BYTES: u64 = 16_810_714_496;
 pub const ORCA_GGUF_SHA256: &str =
     "3445102e9cde5d562508642c100a2f5ac3368a5a3f748442811d7a95daee3bec";
+pub const DEFAULT_CONTEXT_TOKENS: u32 = 8192;
+pub const MAX_CONTEXT_TOKENS: u32 = 32768;
+
+/// Bound GPU allocation without silently truncating a caller's request.
+pub fn validate_context_tokens(context: u32) -> Result<()> {
+    ensure!(
+        (128..=MAX_CONTEXT_TOKENS).contains(&context),
+        "--context-tokens must be in 128..={MAX_CONTEXT_TOKENS}"
+    );
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 pub struct GgufLoadOptions {
@@ -41,7 +52,7 @@ impl GgufLoadOptions {
     pub fn new(model_path: PathBuf) -> Self {
         Self {
             model_path,
-            max_context: 1024,
+            max_context: DEFAULT_CONTEXT_TOKENS,
             prefill_batch_size: 32,
             device_id: 0,
             expected_sha256: None,
@@ -322,10 +333,13 @@ fn prepare(
 ) -> Result<(LlamaSession, GgufAudit)> {
     let started = Instant::now();
     cancellation.bail_if_cancelled()?;
-    let model_bytes = std::fs::metadata(&options.model_path)?.len();
+    // Hold the same ordinary-write exclusion from verification through mapping.
+    // This does not protect against privileged writers or pre-existing mappings.
+    let mut model_file = open_model_for_verification(&options.model_path)?;
+    let model_bytes = model_file.metadata()?.len();
     let model_sha256 = {
         let _span = tracing::info_span!("gguf_verify_identity", model_bytes).entered();
-        let sha256 = hash_file(&options.model_path, &cancellation)?;
+        let sha256 = hash_reader(&mut model_file, &cancellation)?;
         if let Some(expected) = &options.expected_sha256 {
             ensure!(
                 expected.len() == 64 && expected.bytes().all(|byte| byte.is_ascii_hexdigit()),
@@ -375,7 +389,30 @@ fn prepare(
             prefill_batch_size = options.prefill_batch_size
         )
         .entered();
-        LlamaSession::from_model(
+        let mut stage = "metadata clone and validation".to_owned();
+        let mut stage_started = Instant::now();
+        let mut progress = |name: &str, fraction: f64| {
+            let name = if name.starts_with("load llm upload") || name.starts_with("load llm gguf") {
+                "load llm upload"
+            } else if name.starts_with("load llm compile") {
+                "load llm compile"
+            } else {
+                name
+            };
+            if stage != name {
+                if !stage.is_empty() {
+                    tracing::debug!(
+                        stage,
+                        elapsed_ms = stage_started.elapsed().as_secs_f64() * 1000.0,
+                        "GGUF session preparation phase"
+                    );
+                }
+                stage = name.to_owned();
+                stage_started = Instant::now();
+                tracing::trace!(stage, fraction, "GGUF session preparation progress");
+            }
+        };
+        let session = LlamaSession::from_model_with_progress(
             &model,
             LlamaSessionConfig {
                 max_context: Some(options.max_context),
@@ -383,8 +420,15 @@ fn prepare(
                 spec_draft_max: 0,
                 ..LlamaSessionConfig::default()
             },
+            &mut progress,
         )
-        .map_err(makepad_error)?
+        .map_err(makepad_error)?;
+        tracing::debug!(
+            stage,
+            elapsed_ms = stage_started.elapsed().as_secs_f64() * 1000.0,
+            "GGUF session preparation phase"
+        );
+        session
     };
     cancellation.bail_if_cancelled()?;
     let actual_device_name = session.device_name();
@@ -558,10 +602,9 @@ fn check_cancellation(token: &CancellationToken) -> Result<()> {
 }
 
 fn validate_load(options: &GgufLoadOptions) -> Result<()> {
+    validate_context_tokens(options.max_context)?;
     ensure!(
-        (16..=8192).contains(&options.max_context)
-            && (1..=256).contains(&options.prefill_batch_size)
-            && options.device_id >= 0,
+        (1..=256).contains(&options.prefill_batch_size) && options.device_id >= 0,
         "Invalid GGUF context, prefill batch size or device ordinal"
     );
     Ok(())
@@ -604,24 +647,61 @@ fn makepad_error(error: impl std::fmt::Display) -> eyre::Report {
     eyre!("{error}")
 }
 
-fn hash_file(path: &Path, cancellation: &CancellationToken) -> Result<String> {
-    let mut file = File::open(path).wrap_err("Opening local GGUF failed")?;
+fn open_model_for_verification(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(1); // FILE_SHARE_READ
+    }
+    options.open(path).wrap_err("Opening local GGUF failed")
+}
+
+fn hash_reader(file: &mut File, cancellation: &CancellationToken) -> Result<String> {
     let mut digest = Sha256::new();
     let mut bytes = vec![0; 1024 * 1024];
+    let mut read_duration = Duration::ZERO;
+    let mut digest_duration = Duration::ZERO;
+    let mut total_bytes = 0u64;
     loop {
         cancellation.bail_if_cancelled()?;
+        let read_started = Instant::now();
         let read = file.read(&mut bytes)?;
+        read_duration += read_started.elapsed();
         if read == 0 {
             break;
         }
+        let digest_started = Instant::now();
         digest.update(&bytes[..read]);
+        digest_duration += digest_started.elapsed();
+        total_bytes += read as u64;
     }
+    tracing::debug!(
+        total_bytes,
+        read_ms = read_duration.as_secs_f64() * 1000.0,
+        digest_ms = digest_duration.as_secs_f64() * 1000.0,
+        "GGUF identity verification phases"
+    );
     Ok(format!("{:x}", digest.finalize()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn configured_context_has_explicit_allocation_bounds() {
+        assert_eq!(
+            GgufLoadOptions::new("example.gguf".into()).max_context,
+            8192
+        );
+        for context in [128, 1024, 8192, 32768] {
+            validate_context_tokens(context).unwrap();
+        }
+        for context in [0, 127, 32769, u32::MAX] {
+            assert!(validate_context_tokens(context).is_err());
+        }
+    }
     #[test]
     fn facade_is_send_and_sync() {
         fn assert_traits<T: Send + Sync>() {}

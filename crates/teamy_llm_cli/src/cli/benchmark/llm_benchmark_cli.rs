@@ -31,6 +31,9 @@ pub struct BenchmarkCli {
     pub max_new_tokens: usize,
     #[facet(args::named)]
     pub timeout_ms: Option<u64>,
+    /// Orca formatted prompt plus output capacity; default 8192 tokens.
+    #[facet(args::named)]
+    pub context_tokens: Option<u32>,
     #[facet(args::named, default = 1)]
     pub repeat: usize,
     /// Default: Why is the sky blue?
@@ -101,6 +104,7 @@ impl BenchmarkCli {
                     thinking_mode,
                     max_new_tokens: self.max_new_tokens,
                     timeout_ms: self.timeout_ms,
+                    context_tokens: self.context_tokens,
                 };
                 let start = Instant::now();
                 let mut first_token = None;

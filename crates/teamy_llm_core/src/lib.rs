@@ -131,6 +131,9 @@ pub struct GenerateRequest {
     pub thinking_mode: ThinkingMode,
     pub max_new_tokens: usize,
     pub timeout_ms: Option<u64>,
+    /// Total formatted input and output capacity. None selects the provider default.
+    #[facet(default)]
+    pub context_tokens: Option<u32>,
 }
 
 #[repr(u8)]

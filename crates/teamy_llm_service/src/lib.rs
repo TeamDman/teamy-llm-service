@@ -290,6 +290,10 @@ impl TeamyLlmService {
                 "Generation token limit and timeout must be greater than zero",
             ));
         }
+        if let Some(context) = request.context_tokens {
+            teamy_llm_makepad_gguf::validate_context_tokens(context)
+                .map_err(map_invalid_request_error)?;
+        }
         let _gpu_guard = self.lock_gpu_queue(cancellation_token.as_ref())?;
         check_cancelled(cancellation_token.as_ref())?;
         let model_dir = self.resolve_model_dir(&request.selector)?;
@@ -310,6 +314,12 @@ impl TeamyLlmService {
         check_cancelled(cancellation_token.as_ref())?;
         if artifacts.metadata.model_name == ORCA_MODEL_NAME {
             return self.generate_gguf(request, cancellation_token, &artifacts, sink);
+        }
+        if request.context_tokens.is_some() {
+            return Err(ServiceError::new(
+                ServiceErrorKind::InvalidRequest,
+                "--context-tokens is supported by the Orca GGUF provider; legacy Burn context is unchanged",
+            ));
         }
         {
             let _span = tracing::info_span!("llm_cuda_preflight").entered();
@@ -616,7 +626,10 @@ impl TeamyLlmService {
         artifacts: &LlmModelArtifacts,
         sink: &mut impl GenerateEventSink,
     ) -> Result<GenerateResult, ServiceError> {
-        let load_options = GgufLoadOptions::orca_qwen_q4(artifacts.model_path.clone());
+        let mut load_options = GgufLoadOptions::orca_qwen_q4(artifacts.model_path.clone());
+        if let Some(context) = request.context_tokens {
+            load_options.max_context = context;
+        }
         sink.send(GenerateEvent::Started {
             model_dir: artifacts.root.display().to_string(),
         })?;
@@ -653,7 +666,9 @@ impl TeamyLlmService {
             return Err(ServiceError::new(
                 ServiceErrorKind::InvalidRequest,
                 format!(
-                    "Prompt plus requested generation exceeds this adapter's {}-token context; reduce --max-new-tokens",
+                    "Formatted prompt uses {} tokens and requests {} output tokens, exceeding the {}-token context; raise --context-tokens or reduce input/--max-new-tokens",
+                    expected_prompt_token_ids.len(),
+                    request.max_new_tokens,
                     load_options.max_context
                 ),
             ));
@@ -677,6 +692,18 @@ impl TeamyLlmService {
                 )
             })?;
             runtimes.retain(|root, _| root == &artifacts.root);
+            // One resident arena per model. A capacity change must not retain a
+            // second weight copy or silently reuse a smaller KV allocation.
+            if runtimes
+                .get(&artifacts.root)
+                .is_some_and(|runtime| runtime.audit().max_context != load_options.max_context)
+            {
+                tracing::info!(
+                    context_tokens = load_options.max_context,
+                    "replacing GGUF context capacity"
+                );
+                runtimes.remove(&artifacts.root);
+            }
             if let Some(runtime) = runtimes.get(&artifacts.root) {
                 tracing::debug!(provider = "makepad-gguf-cuda", "reusing resident model");
                 runtime.clone()
@@ -923,6 +950,7 @@ mod queue_tests {
                 thinking_mode: ThinkingMode::Direct,
                 max_new_tokens,
                 timeout_ms,
+                context_tokens: None,
             };
             let error = service
                 .generate(request, &mut |_| {
@@ -964,73 +992,4 @@ mod queue_tests {
 }
 
 #[cfg(feature = "vox")]
-pub mod vox_api {
-    use super::*;
-
-    #[vox::service]
-    pub trait TeamyLlm {
-        async fn health(&self) -> ServiceHealth;
-        async fn list_models(&self) -> Result<Vec<ModelStatus>, ServiceError>;
-        async fn inspect_model(&self, selector: ModelSelector)
-        -> Result<ModelReport, ServiceError>;
-        async fn prepare_model(
-            &self,
-            request: PrepareModelRequest,
-            events: vox::Tx<PrepareEvent>,
-        ) -> Result<PrepareModelResult, ServiceError>;
-        async fn generate(
-            &self,
-            request: GenerateRequest,
-            events: vox::Tx<GenerateEvent>,
-        ) -> Result<GenerateResult, ServiceError>;
-    }
-
-    impl TeamyLlm for TeamyLlmService {
-        async fn health(&self) -> ServiceHealth {
-            TeamyLlmService::health(self)
-        }
-
-        async fn list_models(&self) -> Result<Vec<ModelStatus>, ServiceError> {
-            TeamyLlmService::list_models(self)
-        }
-
-        async fn inspect_model(
-            &self,
-            selector: ModelSelector,
-        ) -> Result<ModelReport, ServiceError> {
-            TeamyLlmService::inspect_model(self, selector)
-        }
-
-        async fn prepare_model(
-            &self,
-            request: PrepareModelRequest,
-            events: vox::Tx<PrepareEvent>,
-        ) -> Result<PrepareModelResult, ServiceError> {
-            TeamyLlmService::prepare_model(self, request, |event| {
-                events.try_send(event).map_err(|error| {
-                    ServiceError::new(ServiceErrorKind::Cancelled, error.to_string())
-                })
-            })
-            .await
-        }
-
-        async fn generate(
-            &self,
-            request: GenerateRequest,
-            events: vox::Tx<GenerateEvent>,
-        ) -> Result<GenerateResult, ServiceError> {
-            TeamyLlmService::generate(self, request, &mut |event| {
-                events.try_send(event).map_err(|error| {
-                    ServiceError::new(ServiceErrorKind::Cancelled, error.to_string())
-                })
-            })
-        }
-    }
-
-    pub async fn serve_local(
-        address: &str,
-        service: TeamyLlmService,
-    ) -> Result<(), vox::ServeError> {
-        vox::serve(address, TeamyLlmDispatcher::new(service)).await
-    }
-}
+pub mod vox_api;

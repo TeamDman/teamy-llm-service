@@ -24,6 +24,9 @@ pub struct InteractiveCli {
     /// Generation timeout excluding queue/model loading; must be positive.
     #[facet(args::named)]
     pub timeout_ms: Option<u64>,
+    /// Orca formatted prompt plus output capacity; default 8192 tokens.
+    #[facet(args::named)]
+    pub context_tokens: Option<u32>,
     /// Explicit finite-choice backend: native or onnx.
     #[facet(args::named)]
     pub decision_provider: Option<DecisionProvider>,

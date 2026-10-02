@@ -81,10 +81,11 @@ pub fn main() -> Result<()> {
             let service = TeamyLlmService::from_default_dirs()?;
             match cli.command {
                 Command::Health(args) => args.invoke(&service, requested_output)?,
-                Command::Serve(args) => args.invoke(service).await?,
+                Command::Serve(args) => args.invoke(service, cancellation.clone()).await?,
                 Command::Model(args) => args.invoke(&service, requested_output).await?,
                 Command::Prompt(args) => {
-                    args.invoke(&service, requested_output, cancellation.clone())?
+                    args.invoke(&service, requested_output, cancellation.clone())
+                        .await?
                 }
                 Command::Interactive(args) => {
                     interactive::run_interactive(args, service, cancellation.clone()).await?
