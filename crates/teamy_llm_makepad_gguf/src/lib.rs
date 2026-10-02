@@ -15,10 +15,15 @@ use eyre::{Result, WrapErr, ensure, eyre};
 use facet::Facet;
 use makepad_ai_llm::{
     LlamaArchitecture, LlamaModel, LlamaSamplerState, LlamaSamplingParams, LlamaSession,
-    LlamaSessionConfig, LlamaStopReason,
+    LlamaSessionConfig, LlamaStopReason, MappedRegion,
 };
 use sha2::{Digest, Sha256};
 use teamy_cancellation::CancellationToken;
+
+pub mod chunk_verification;
+
+#[cfg(test)]
+mod mapped_weights_tests;
 
 pub const MAKEPAD_REVISION: &str = "9e5e3d2b03214f8c2c37adffa0e308c815662060";
 pub const ORCA_MODEL_NAME: &str = "qwen3.8-27b-uncensored-q4-k-m";
@@ -26,6 +31,11 @@ pub const ORCA_GGUF_REVISION: &str = "fc437a3374c9977bdc339a8ec106dcd9a0357001";
 pub const ORCA_GGUF_BYTES: u64 = 16_810_714_496;
 pub const ORCA_GGUF_SHA256: &str =
     "3445102e9cde5d562508642c100a2f5ac3368a5a3f748442811d7a95daee3bec";
+// Generated from one guarded pass that also matched ORCA_GGUF_SHA256 and exact size.
+// The canonical root binds version, chunk size, file size, whole SHA and ordered digests.
+const ORCA_CHUNK_TABLE_SHA256: &str =
+    "4c5382f01047942fa3258670a54cd842754fa832bcd15d8e434a9fa99d4ddfd8";
+const ORCA_CHUNK_DIGESTS: &[u8] = include_bytes!("../assets/orca-q4-k-m.sha256-chunks.bin");
 pub const DEFAULT_CONTEXT_TOKENS: u32 = 8192;
 pub const MAX_CONTEXT_TOKENS: u32 = 32768;
 
@@ -68,11 +78,51 @@ impl GgufLoadOptions {
     }
 }
 
+/// CPU-only artifact preparation, movable to the CUDA owner after input validation.
+///
+/// Private fields bind the validated options and metadata to their live file guard and verified
+/// view. Dropping a rejected preflight releases these resources without creating a GPU session.
+#[derive(Debug)]
+pub struct GgufPreflight {
+    options: GgufLoadOptions,
+    cancellation: CancellationToken,
+    started: Instant,
+    _model_file: File,
+    model_bytes: u64,
+    model_sha256: String,
+    model_identity_verification: String,
+    verified_mapping: Option<Arc<MappedRegion>>,
+    model: LlamaModel,
+    main_layers: u32,
+    ignored_mtp_layers: u32,
+    embedding_length: u32,
+    feed_forward_length: u32,
+}
+
+impl GgufPreflight {
+    #[must_use]
+    pub fn max_context(&self) -> u32 {
+        self.options.max_context
+    }
+
+    #[must_use]
+    pub fn model_bytes(&self) -> u64 {
+        self.model_bytes
+    }
+
+    fn check_loading_cancellation(&self, cancellation: &CancellationToken) -> Result<()> {
+        self.cancellation.bail_if_cancelled()?;
+        cancellation.bail_if_cancelled()
+    }
+}
+
 #[derive(Clone, Debug, Facet)]
 pub struct GgufAudit {
     pub provider: String,
     pub source_revision: String,
     pub model_sha256: String,
+    /// The verification scheme used now; a chunk commitment is not a new serial whole SHA.
+    pub model_identity_verification: String,
     pub model_bytes: u64,
     pub architecture: String,
     pub gguf_file_type: Option<u32>,
@@ -208,30 +258,35 @@ impl GgufRuntime {
     pub fn load(options: GgufLoadOptions, cancellation: CancellationToken) -> Result<Self> {
         validate_load(&options)?;
         cancellation.bail_if_cancelled()?;
-        // Makepad currently reads device selection from process environment, and would write a
-        // cuBLAS setting when absent. Require startup configuration instead of mutating environment
-        // after any service threads exist. This adapter never writes environment or toolkit config.
-        ensure!(
-            cfg!(any(target_os = "windows", target_os = "linux")),
-            "This adapter requires native CUDA on Windows or Linux"
-        );
-        ensure!(
-            configured_device()? == options.device_id,
-            "Requested device differs from MAKEPAD_LLAMA_CUDA_DEVICE (default 0); configure it before process startup"
-        );
-        ensure!(
-            matches!(
-                std::env::var("CUBLAS_WORKSPACE_CONFIG").as_deref(),
-                Ok(":4096:8" | ":16:8")
-            ),
-            "Set CUBLAS_WORKSPACE_CONFIG=:4096:8 or :16:8 before process startup"
-        );
+        validate_cuda_startup(&options)?;
+        let preflight = Self::preflight(options, &cancellation)?;
+        Self::load_preflight(preflight, cancellation)
+    }
+
+    /// Read/hash/parse artifacts and validate their supported layout without initializing CUDA.
+    /// Callers may overlap this CPU work with independent tokenizer/input validation, then join
+    /// both before calling `load_preflight`. The original cancellation remains bound to the result.
+    pub fn preflight(
+        options: GgufLoadOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<GgufPreflight> {
+        prepare_preflight(options, cancellation)
+    }
+
+    /// Prepare CUDA on its dedicated owner only after the caller accepts the input/preflight.
+    /// Both the preflight's original cancellation and this caller's cancellation are honored.
+    pub fn load_preflight(
+        preflight: GgufPreflight,
+        cancellation: CancellationToken,
+    ) -> Result<Self> {
+        preflight.check_loading_cancellation(&cancellation)?;
+        validate_cuda_startup(&preflight.options)?;
         let (commands, receiver) = mpsc::sync_channel(1);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("teamy-gguf-cuda-owner".into())
             .spawn(move || {
-                let prepared = prepare(options, cancellation);
+                let prepared = prepare(preflight, cancellation);
                 match prepared {
                     Ok((mut session, audit)) => {
                         if ready_sender.send(Ok(audit)).is_err() {
@@ -327,30 +382,63 @@ impl GgufRuntime {
     }
 }
 
-fn prepare(
+fn prepare_preflight(
     options: GgufLoadOptions,
-    cancellation: CancellationToken,
-) -> Result<(LlamaSession, GgufAudit)> {
+    cancellation: &CancellationToken,
+) -> Result<GgufPreflight> {
     let started = Instant::now();
+    validate_load(&options)?;
     cancellation.bail_if_cancelled()?;
     // Hold the same ordinary-write exclusion from verification through mapping.
     // This does not protect against privileged writers or pre-existing mappings.
     let mut model_file = open_model_for_verification(&options.model_path)?;
     let model_bytes = model_file.metadata()?.len();
-    let model_sha256 = {
+    let (model_sha256, model_identity_verification, verified_mapping) = {
         let _span = tracing::info_span!("gguf_verify_identity", model_bytes).entered();
-        let sha256 = hash_reader(&mut model_file, &cancellation)?;
         if let Some(expected) = &options.expected_sha256 {
             ensure!(
                 expected.len() == 64 && expected.bytes().all(|byte| byte.is_ascii_hexdigit()),
                 "Malformed expected GGUF SHA-256"
             );
-            ensure!(
-                sha256.eq_ignore_ascii_case(expected),
-                "GGUF SHA-256 differs from the frozen identity"
-            );
         }
-        sha256
+        if options
+            .expected_sha256
+            .as_deref()
+            .is_some_and(|expected| expected.eq_ignore_ascii_case(ORCA_GGUF_SHA256))
+        {
+            ensure!(
+                model_bytes == ORCA_GGUF_BYTES,
+                "GGUF size differs from the frozen identity"
+            );
+            let mapping =
+                Arc::new(MappedRegion::map_file(&options.model_path).map_err(makepad_error)?);
+            let commitment = orca_chunk_commitment();
+            let receipt =
+                chunk_verification::verify_chunks(mapping.as_slice(), &commitment, cancellation)?;
+            tracing::debug!(
+                verification = "compiled-sha256-chunks-v1",
+                verified_bytes = receipt.verified_bytes,
+                verified_chunks = receipt.verified_chunks,
+                workers = receipt.worker_count,
+                elapsed_ms = receipt.elapsed_ms,
+                table_sha256 = %receipt.table_sha256,
+                "GGUF every-byte identity verification"
+            );
+            (
+                receipt.expected_whole_sha256,
+                "compiled-sha256-chunks-v1".into(),
+                Some(mapping),
+            )
+        } else {
+            let sha256 = hash_reader(&mut model_file, cancellation)?;
+            if let Some(expected) = &options.expected_sha256 {
+                ensure!(
+                    sha256.eq_ignore_ascii_case(expected),
+                    "GGUF SHA-256 differs from the frozen identity"
+                );
+            }
+            (sha256, "full-sha256".into(), None)
+        }
     };
     cancellation.bail_if_cancelled()?;
     let model = {
@@ -381,6 +469,31 @@ fn prepare(
     // MTP is intentionally disabled. Weight inventory and CUDA buffers retain GGUF quantization.
     ensure!(!model.load_mtp(), "Unexpected MTP execution policy");
     cancellation.bail_if_cancelled()?;
+    Ok(GgufPreflight {
+        options,
+        cancellation: cancellation.clone(),
+        started,
+        _model_file: model_file,
+        model_bytes,
+        model_sha256,
+        model_identity_verification,
+        verified_mapping,
+        model,
+        main_layers,
+        ignored_mtp_layers,
+        embedding_length,
+        feed_forward_length,
+    })
+}
+
+fn prepare(
+    preflight: GgufPreflight,
+    cancellation: CancellationToken,
+) -> Result<(LlamaSession, GgufAudit)> {
+    preflight.check_loading_cancellation(&cancellation)?;
+    let options = &preflight.options;
+    let model = &preflight.model;
+    let main_layers = preflight.main_layers;
     let session = {
         let _span = tracing::info_span!(
             "gguf_prepare_session",
@@ -412,16 +525,22 @@ fn prepare(
                 tracing::trace!(stage, fraction, "GGUF session preparation progress");
             }
         };
-        let session = LlamaSession::from_model_with_progress(
-            &model,
-            LlamaSessionConfig {
-                max_context: Some(options.max_context),
-                prefill_batch_size: options.prefill_batch_size,
-                spec_draft_max: 0,
-                ..LlamaSessionConfig::default()
-            },
-            &mut progress,
-        )
+        let config = LlamaSessionConfig {
+            max_context: Some(options.max_context),
+            prefill_batch_size: options.prefill_batch_size,
+            spec_draft_max: 0,
+            ..LlamaSessionConfig::default()
+        };
+        let session = if let Some(mapping) = &preflight.verified_mapping {
+            LlamaSession::from_model_with_mapped_weights_and_progress(
+                model,
+                config,
+                mapping.clone(),
+                &mut progress,
+            )
+        } else {
+            LlamaSession::from_model_with_progress(model, config, &mut progress)
+        }
         .map_err(makepad_error)?;
         tracing::debug!(
             stage,
@@ -430,7 +549,7 @@ fn prepare(
         );
         session
     };
-    cancellation.bail_if_cancelled()?;
+    preflight.check_loading_cancellation(&cancellation)?;
     let actual_device_name = session.device_name();
     ensure!(
         actual_device_name != "metal",
@@ -439,21 +558,22 @@ fn prepare(
     let audit = GgufAudit {
         provider: "makepad-native-cuda-gguf".into(),
         source_revision: MAKEPAD_REVISION.into(),
-        model_sha256,
-        model_bytes,
+        model_sha256: preflight.model_sha256.clone(),
+        model_identity_verification: preflight.model_identity_verification.clone(),
+        model_bytes: preflight.model_bytes,
         architecture: model.architecture.name().into(),
         gguf_file_type: model.general.file_type,
         main_layers,
-        ignored_mtp_layers,
-        embedding_length,
-        feed_forward_length,
+        ignored_mtp_layers: preflight.ignored_mtp_layers,
+        embedding_length: preflight.embedding_length,
+        feed_forward_length: preflight.feed_forward_length,
         requested_device_id: options.device_id,
         actual_device_name,
         quantized_weight_residency: true,
         cpu_fallback: false,
         max_context: options.max_context,
         prefill_batch_size: options.prefill_batch_size,
-        load_ms: started.elapsed().as_secs_f64() * 1000.0,
+        load_ms: preflight.started.elapsed().as_secs_f64() * 1000.0,
     };
     tracing::info!(device = %audit.actual_device_name, architecture = %audit.architecture,
         "Resident GGUF CUDA session prepared");
@@ -610,6 +730,27 @@ fn validate_load(options: &GgufLoadOptions) -> Result<()> {
     Ok(())
 }
 
+fn validate_cuda_startup(options: &GgufLoadOptions) -> Result<()> {
+    // Makepad reads device selection from process environment and would write a cuBLAS setting
+    // when absent. Require startup configuration; this adapter never mutates that environment.
+    ensure!(
+        cfg!(any(target_os = "windows", target_os = "linux")),
+        "This adapter requires native CUDA on Windows or Linux"
+    );
+    ensure!(
+        configured_device()? == options.device_id,
+        "Requested device differs from MAKEPAD_LLAMA_CUDA_DEVICE (default 0); configure it before process startup"
+    );
+    ensure!(
+        matches!(
+            std::env::var("CUBLAS_WORKSPACE_CONFIG").as_deref(),
+            Ok(":4096:8" | ":16:8")
+        ),
+        "Set CUBLAS_WORKSPACE_CONFIG=:4096:8 or :16:8 before process startup"
+    );
+    Ok(())
+}
+
 fn validate_generation(prompt: &str, options: &GgufGenerationOptions) -> Result<()> {
     ensure!(
         !prompt.is_empty()
@@ -658,6 +799,17 @@ fn open_model_for_verification(path: &Path) -> Result<File> {
     options.open(path).wrap_err("Opening local GGUF failed")
 }
 
+fn orca_chunk_commitment() -> chunk_verification::TrustedChunkCommitment<'static> {
+    chunk_verification::TrustedChunkCommitment {
+        version: chunk_verification::CHUNK_TABLE_VERSION,
+        chunk_bytes: chunk_verification::DEFAULT_CHUNK_BYTES,
+        total_bytes: ORCA_GGUF_BYTES,
+        whole_sha256: ORCA_GGUF_SHA256,
+        table_sha256: ORCA_CHUNK_TABLE_SHA256,
+        digests: ORCA_CHUNK_DIGESTS,
+    }
+}
+
 fn hash_reader(file: &mut File, cancellation: &CancellationToken) -> Result<String> {
     let mut digest = Sha256::new();
     let mut bytes = vec![0; 1024 * 1024];
@@ -690,6 +842,22 @@ fn hash_reader(file: &mut File, cancellation: &CancellationToken) -> Result<Stri
 mod tests {
     use super::*;
     #[test]
+    fn frozen_orca_chunk_table_matches_the_compiled_canonical_commitment() {
+        let table = orca_chunk_commitment();
+        assert_eq!(ORCA_CHUNK_DIGESTS.len(), 1002 * 32);
+        assert_eq!(
+            chunk_verification::canonical_table_sha256(
+                table.version,
+                table.chunk_bytes,
+                table.total_bytes,
+                table.whole_sha256,
+                table.digests,
+            )
+            .unwrap(),
+            ORCA_CHUNK_TABLE_SHA256
+        );
+    }
+    #[test]
     fn configured_context_has_explicit_allocation_bounds() {
         assert_eq!(
             GgufLoadOptions::new("example.gguf".into()).max_context,
@@ -706,6 +874,39 @@ mod tests {
     fn facade_is_send_and_sync() {
         fn assert_traits<T: Send + Sync>() {}
         assert_traits::<GgufRuntime>();
+        assert_traits::<GgufPreflight>();
+    }
+
+    #[test]
+    fn artifact_preflight_rejects_invalid_bounds_before_file_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("no-such-model.gguf");
+        let mut options = GgufLoadOptions::new(missing.clone());
+        options.max_context = 127;
+        let error = GgufRuntime::preflight(options, &CancellationToken::new()).unwrap_err();
+        assert!(error.to_string().contains("--context-tokens"));
+        let mut options = GgufLoadOptions::new(missing.clone());
+        options.prefill_batch_size = 0;
+        let error = GgufRuntime::preflight(options, &CancellationToken::new()).unwrap_err();
+        assert!(error.to_string().contains("prefill batch size"));
+        let mut options = GgufLoadOptions::new(missing);
+        options.device_id = -1;
+        let error = GgufRuntime::preflight(options, &CancellationToken::new()).unwrap_err();
+        assert!(error.to_string().contains("device ordinal"));
+    }
+
+    #[test]
+    fn artifact_preflight_honors_cancellation_before_file_access_or_cuda() {
+        let directory = tempfile::tempdir().unwrap();
+        let options = GgufLoadOptions::new(directory.path().join("no-such-model.gguf"));
+        let cancellation = CancellationToken::new();
+        cancellation.request_cancel("artifact preflight fixture cancelled");
+        let error = GgufRuntime::preflight(options, &cancellation).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("artifact preflight fixture cancelled")
+        );
     }
     #[test]
     fn prompt_identity_rejects_any_token_or_order_mismatch() {

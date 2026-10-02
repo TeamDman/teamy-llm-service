@@ -253,6 +253,51 @@ pub fn hugging_face_resolve_url(repo_id: &str, file_name: &str) -> String {
 ///
 /// This function will return an error if the directory is incomplete or incompatible.
 pub fn inspect_model_dir(root: &Path) -> eyre::Result<LlmModelArtifacts> {
+    inspect_model_dir_with_tokenizer_validation(root, |tokenizer_path| {
+        tokenizers::Tokenizer::from_file(tokenizer_path)
+            .map(|_| ())
+            .map_err(|error| {
+                eyre::eyre!(
+                    "Failed to load tokenizer from {}: {}",
+                    tokenizer_path.display(),
+                    error
+                )
+            })
+    })
+}
+
+/// Inspect artifacts while letting a resident service retain its validated tokenizer.
+///
+/// The callback must load or validate the tokenizer at the supplied path and reject invalid
+/// contents. It is called exactly once after [`inspect_model_files`] succeeds. This is a
+/// validated inspection API; callers that defer tokenizer parsing must use the explicitly
+/// structural [`inspect_model_files`] API instead. Tokenization options are unchanged.
+///
+/// # Errors
+///
+/// Returns the callback's validation error or an incomplete/incompatible artifact error.
+pub fn inspect_model_dir_with_tokenizer_validation(
+    root: &Path,
+    validate_tokenizer: impl FnOnce(&Path) -> eyre::Result<()>,
+) -> eyre::Result<LlmModelArtifacts> {
+    let artifacts = inspect_model_files(root)?;
+    validate_tokenizer(&artifacts.tokenizer_path)?;
+    Ok(artifacts)
+}
+
+/// Inspect the model directory's files and declared metadata without parsing the tokenizer.
+///
+/// This structural inspection performs the same artifact presence and metadata/path checks
+/// as [`inspect_model_dir`]. It does not validate tokenizer contents, verify model weight
+/// identity or construct a GPU runtime. A service may use it to overlap CPU preparation,
+/// but must successfully validate the tokenizer before caching validated artifacts or
+/// beginning generation. Ordinary callers should use [`inspect_model_dir`] or
+/// [`inspect_model_dir_with_tokenizer_validation`].
+///
+/// # Errors
+///
+/// Returns an incomplete directory, malformed metadata or incompatible declared-path error.
+pub fn inspect_model_files(root: &Path) -> eyre::Result<LlmModelArtifacts> {
     ensure_existing_dir(root)?;
 
     let tokenizer_path = root.join(TOKENIZER_FILE_NAME);
@@ -263,14 +308,6 @@ pub fn inspect_model_dir(root: &Path) -> eyre::Result<LlmModelArtifacts> {
             tokenizer_path.display()
         );
     }
-
-    tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|error| {
-        eyre::eyre!(
-            "Failed to load tokenizer from {}: {}",
-            tokenizer_path.display(),
-            error
-        )
-    })?;
 
     let tokenizer_config_path = root.join(TOKENIZER_CONFIG_FILE_NAME);
     if !tokenizer_config_path.is_file() {
@@ -1074,6 +1111,7 @@ mod tests {
     use super::{
         HF_CONFIG_FILE_NAME, KNOWN_LLM_MODELS, MODEL_FILE_NAME, MODEL_METADATA_FILE_NAME,
         TOKENIZER_CONFIG_FILE_NAME, TOKENIZER_FILE_NAME, inspect_model_dir,
+        inspect_model_dir_with_tokenizer_validation, inspect_model_files,
         load_tokenizer_config_summary, remove_existing_path, write_model_metadata,
     };
     use tokenizers::{Tokenizer, models::bpe::BPE};
@@ -1123,6 +1161,118 @@ mod tests {
             Some(MODEL_FILE_NAME)
         );
         assert!(root.join(MODEL_METADATA_FILE_NAME).is_file());
+    }
+
+    #[test]
+    fn inspection_callback_validates_once_and_standalone_inspection_still_rejects_bad_tokenizer() {
+        let temp = tempfile::tempdir().expect("fixture directory");
+        let root = temp.path();
+        std::fs::write(root.join(MODEL_FILE_NAME), b"model-fixture").unwrap();
+        Tokenizer::new(BPE::default())
+            .save(root.join(TOKENIZER_FILE_NAME), false)
+            .unwrap();
+        std::fs::write(root.join(TOKENIZER_CONFIG_FILE_NAME), "{}").unwrap();
+        std::fs::write(root.join(HF_CONFIG_FILE_NAME), "{}").unwrap();
+        write_model_metadata(root, &KNOWN_LLM_MODELS[0], false).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let artifacts = inspect_model_dir_with_tokenizer_validation(root, |path| {
+            calls.set(calls.get() + 1);
+            assert_eq!(path, root.join(TOKENIZER_FILE_NAME));
+            Tokenizer::from_file(path)
+                .map(|_| ())
+                .map_err(|error| eyre::eyre!(error.to_string()))
+        })
+        .expect("callback validated artifacts");
+        assert_eq!(calls.get(), 1);
+        assert_eq!(artifacts.metadata.model_name, KNOWN_LLM_MODELS[0].name);
+
+        std::fs::write(root.join(TOKENIZER_FILE_NAME), "invalid tokenizer").unwrap();
+        let error = inspect_model_dir(root).expect_err("standalone validation remains mandatory");
+        assert!(error.to_string().contains("Failed to load tokenizer"));
+        let error = inspect_model_dir_with_tokenizer_validation(root, |_| {
+            eyre::bail!("retained tokenizer rejected replacement")
+        })
+        .expect_err("callback failure must stop inspection");
+        assert!(
+            error
+                .to_string()
+                .contains("retained tokenizer rejected replacement")
+        );
+    }
+
+    fn write_inspection_fixture(root: &std::path::Path) {
+        std::fs::write(root.join(MODEL_FILE_NAME), b"model-fixture").unwrap();
+        Tokenizer::new(BPE::default())
+            .save(root.join(TOKENIZER_FILE_NAME), false)
+            .unwrap();
+        std::fs::write(root.join(TOKENIZER_CONFIG_FILE_NAME), "{}").unwrap();
+        std::fs::write(root.join(HF_CONFIG_FILE_NAME), "{}").unwrap();
+        write_model_metadata(root, &KNOWN_LLM_MODELS[0], false).unwrap();
+    }
+
+    #[test]
+    fn structural_inspection_defers_tokenizer_contents_but_validated_apis_reject_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        write_inspection_fixture(root);
+        std::fs::write(root.join(TOKENIZER_FILE_NAME), b"invalid tokenizer").unwrap();
+        let artifacts = inspect_model_files(root).expect("structural files are complete");
+        assert_eq!(artifacts.metadata.model_name, KNOWN_LLM_MODELS[0].name);
+        assert_eq!(artifacts.tokenizer_path, root.join(TOKENIZER_FILE_NAME));
+        assert!(
+            inspect_model_dir(root)
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to load tokenizer")
+        );
+        let calls = std::cell::Cell::new(0);
+        let error = inspect_model_dir_with_tokenizer_validation(root, |path| {
+            calls.set(calls.get() + 1);
+            Tokenizer::from_file(path)
+                .map(|_| ())
+                .map_err(|error| eyre::eyre!(error.to_string()))
+        })
+        .expect_err("validated callback API must reject malformed tokenizer contents");
+        assert_eq!(calls.get(), 1);
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn structural_and_validated_inspection_share_artifacts_and_required_file_checks() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        write_inspection_fixture(root);
+        assert_eq!(
+            inspect_model_files(root).unwrap(),
+            inspect_model_dir(root).unwrap()
+        );
+        for file in [
+            MODEL_FILE_NAME,
+            TOKENIZER_FILE_NAME,
+            TOKENIZER_CONFIG_FILE_NAME,
+            HF_CONFIG_FILE_NAME,
+            MODEL_METADATA_FILE_NAME,
+        ] {
+            let path = root.join(file);
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let structural = inspect_model_files(root).unwrap_err().to_string();
+            assert_eq!(structural, inspect_model_dir(root).unwrap_err().to_string());
+            let calls = std::cell::Cell::new(0);
+            let validated = inspect_model_dir_with_tokenizer_validation(root, |_| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(structural, validated.to_string());
+            assert_eq!(calls.get(), 0, "incomplete artifacts must not be validated");
+            std::fs::write(path, bytes).unwrap();
+        }
+        std::fs::write(root.join(MODEL_METADATA_FILE_NAME), "invalid metadata").unwrap();
+        assert_eq!(
+            inspect_model_files(root).unwrap_err().to_string(),
+            inspect_model_dir(root).unwrap_err().to_string()
+        );
     }
 
     #[test]

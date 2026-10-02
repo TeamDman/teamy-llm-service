@@ -228,10 +228,27 @@ retains a file handle that excludes ordinary writes and deletion while the mappi
 CUDA still uploads weights to device memory; mapping avoids the separate owned host weight
 arena. If mapping fails, the loader reports the reason and uses its owned-arena path.
 
-Our adapter performs the full frozen SHA-256 check on each runtime load before session
-preparation. This is our identity check, rather than a Makepad requirement; resident reuse
-avoids repeating it for the same loaded runtime. Cold loading still includes verification,
-GPU upload and session preparation. The vendor changes start from Makepad revision
+Our adapter verifies every model byte on each runtime load before session preparation.
+The known Orca artifact uses a compiled table of 1,002 ordered SHA-256 chunk digests,
+checked against an independently compiled canonical root. The table was authored in one
+guarded pass that also matched the original frozen whole-file SHA-256. Bounded parallel
+workers (up to 32 available logical CPUs) freshly verify all chunks; file timestamps and mutable receipts cannot skip this
+check. Unknown identities retain serial whole-file hashing. Audit output distinguishes
+`compiled-sha256-chunks-v1` from `full-sha256`; the former identifies the original full hash
+through its trusted commitment rather than claiming a new serial whole-file digest.
+
+This is our identity policy, rather than a Makepad requirement. Resident reuse avoids
+repeating it for the same loaded runtime. The loader retains the exact verified mapping
+for weight loading and reserve retries. Cold generation overlaps CPU-only model verification
+with tokenizer parsing in a scoped worker. Both jobs must finish successfully, and the exact
+prompt/output token budget must fit, before a new GPU session is constructed. Tokenizer
+failures cancel and join the CPU reader; structural-only artifact inspection cannot enter
+the validated cache. Compatible resident sessions avoid another model hash.
+
+Windows uploads use two bounded 64 MiB pinned
+staging slots; completion events prevent reuse while DMA is reading them, and cleanup
+drains pending transfers before freeing host memory. Cold loading still includes fresh
+verification, GPU upload and session preparation. The vendor changes start from Makepad revision
 `9e5e3d2b03214f8c2c37adffa0e308c815662060` and retain its numerical execution and CUDA kernels.
 Read-only sharing assumes immutable backing bytes and a stable model path; it does not protect
 against privileged mutation or path retargeting. Measure cold-start latency separately from

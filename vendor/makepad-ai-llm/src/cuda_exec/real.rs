@@ -60,6 +60,13 @@ use crate::runtime::{
 };
 use crate::weights::LoadedGgufWeights;
 
+// The Windows driver can otherwise bounce each pageable/mapped H2D source
+// through its own staging buffer. Keep the local bounded staging change out
+// of the upstream Unix upload path.
+#[cfg(windows)]
+#[path = "initial_upload.rs"]
+mod initial_upload;
+
 // cudaMemcpyKind::cudaMemcpyDeviceToDevice. Official ggml-cuda cpy.cu:418.
 const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
 
@@ -658,6 +665,9 @@ impl Runtime {
         }
 
         unsafe {
+            #[cfg(windows)]
+            let allocation_started = Instant::now();
+            #[cfg(not(windows))]
             let stream = self.state.stream;
             let mut ro_dev: *mut c_void = std::ptr::null_mut();
             if ro_split > 0 {
@@ -682,59 +692,73 @@ impl Runtime {
                 main_size,
             };
 
-            // Upload the weight region once (chunked; source is the mmap so
-            // clean pages stream straight from the file cache), zero the
-            // dirty region, then upload the resident dirty prefix (caches,
-            // and the whole weight arena for non-mmap contexts).
-            const CHUNK: usize = 256 << 20;
-            let mut offset = 0usize;
-            progress(0, ro_split);
-            while offset < ro_split {
-                let len = CHUNK.min(ro_split - offset);
-                let host = ctx.data_at(offset, len).map_err(LlamaError::format)?;
-                check(
-                    cudaMemcpyAsync(
-                        arena.ptr_at(offset, len)?,
-                        host.as_ptr() as *const c_void,
-                        len,
-                        CUDA_MEMCPY_HOST_TO_DEVICE,
-                        stream,
-                    ),
-                    "weights upload",
+            #[cfg(windows)]
+            {
+                initial_upload::upload_arena(
+                    ctx,
+                    &arena,
+                    progress,
+                    allocation_started.elapsed().as_secs_f64() * 1000.0,
                 )?;
-                // Bounded in-flight window: one chunk at a time.
-                check(cudaStreamSynchronize(stream), "weights upload sync")?;
-                offset += len;
-                progress(offset, ro_split);
+                Ok(arena)
             }
-            check(
-                cudaMemsetAsync(arena.main_dev, 0, arena.main_size.max(1), stream),
-                "dirty region clear",
-            )?;
-            let dirty_used = ctx.used_mem().saturating_sub(ro_split);
-            let total = ro_split.saturating_add(dirty_used);
-            let mut offset = 0usize;
-            while offset < dirty_used {
-                let len = CHUNK.min(dirty_used - offset);
-                let host = ctx
-                    .data_at(ro_split + offset, len)
-                    .map_err(LlamaError::format)?;
+
+            #[cfg(not(windows))]
+            {
+                // Upload the weight region once (chunked; source is the mmap so
+                // clean pages stream straight from the file cache), zero the
+                // dirty region, then upload the resident dirty prefix (caches,
+                // and the whole weight arena for non-mmap contexts).
+                const CHUNK: usize = 256 << 20;
+                let mut offset = 0usize;
+                progress(0, ro_split);
+                while offset < ro_split {
+                    let len = CHUNK.min(ro_split - offset);
+                    let host = ctx.data_at(offset, len).map_err(LlamaError::format)?;
+                    check(
+                        cudaMemcpyAsync(
+                            arena.ptr_at(offset, len)?,
+                            host.as_ptr() as *const c_void,
+                            len,
+                            CUDA_MEMCPY_HOST_TO_DEVICE,
+                            stream,
+                        ),
+                        "weights upload",
+                    )?;
+                    // Bounded in-flight window: one chunk at a time.
+                    check(cudaStreamSynchronize(stream), "weights upload sync")?;
+                    offset += len;
+                    progress(offset, ro_split);
+                }
                 check(
-                    cudaMemcpyAsync(
-                        arena.ptr_at(ro_split + offset, len)?,
-                        host.as_ptr() as *const c_void,
-                        len,
-                        CUDA_MEMCPY_HOST_TO_DEVICE,
-                        stream,
-                    ),
-                    "state upload",
+                    cudaMemsetAsync(arena.main_dev, 0, arena.main_size.max(1), stream),
+                    "dirty region clear",
                 )?;
-                check(cudaStreamSynchronize(stream), "state upload sync")?;
-                offset += len;
-                progress(ro_split + offset, total.max(1));
+                let dirty_used = ctx.used_mem().saturating_sub(ro_split);
+                let total = ro_split.saturating_add(dirty_used);
+                let mut offset = 0usize;
+                while offset < dirty_used {
+                    let len = CHUNK.min(dirty_used - offset);
+                    let host = ctx
+                        .data_at(ro_split + offset, len)
+                        .map_err(LlamaError::format)?;
+                    check(
+                        cudaMemcpyAsync(
+                            arena.ptr_at(ro_split + offset, len)?,
+                            host.as_ptr() as *const c_void,
+                            len,
+                            CUDA_MEMCPY_HOST_TO_DEVICE,
+                            stream,
+                        ),
+                        "state upload",
+                    )?;
+                    check(cudaStreamSynchronize(stream), "state upload sync")?;
+                    offset += len;
+                    progress(ro_split + offset, total.max(1));
+                }
+                check(cudaStreamSynchronize(stream), "arena upload sync")?;
+                Ok(arena)
             }
-            check(cudaStreamSynchronize(stream), "arena upload sync")?;
-            Ok(arena)
         }
     }
 

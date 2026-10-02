@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::{ggml_row_size_for_type, TensorType};
 
@@ -542,6 +543,17 @@ impl LlamaSession {
         progress: &mut dyn FnMut(&str, f64),
     ) -> Result<Self> {
         Self::from_owned_model_with_progress(model.clone(), config, progress)
+    }
+
+    /// Construct with a caller's already verified immutable mapping instead of reopening it.
+    /// The same view remains owned by the weight context, including graph-reserve retries.
+    pub fn from_model_with_mapped_weights_and_progress(
+        model: &LlamaModel,
+        config: LlamaSessionConfig,
+        mapping: Arc<crate::MappedRegion>,
+        progress: &mut dyn FnMut(&str, f64),
+    ) -> Result<Self> {
+        Self::from_owned_model_with_mapping_and_progress(model.clone(), config, Some(mapping), progress)
     }
 
     pub fn model(&self) -> &LlamaModel {
@@ -1347,8 +1359,17 @@ impl LlamaSession {
     }
 
     fn from_owned_model_with_progress(
+        model: LlamaModel,
+        config: LlamaSessionConfig,
+        progress: &mut dyn FnMut(&str, f64),
+    ) -> Result<Self> {
+        Self::from_owned_model_with_mapping_and_progress(model, config, None, progress)
+    }
+
+    fn from_owned_model_with_mapping_and_progress(
         mut model: LlamaModel,
         config: LlamaSessionConfig,
+        mapping: Option<Arc<crate::MappedRegion>>,
         progress: &mut dyn FnMut(&str, f64),
     ) -> Result<Self> {
         // The nextn block only enters the tensor inventory (and therefore
@@ -1539,6 +1560,7 @@ impl LlamaSession {
             config.max_sequences as usize,
             context_extra_bytes,
             prompt_batch_capacity(config.prefill_batch_size, max_context_usize),
+            mapping.as_ref(),
             progress,
         )?;
 
@@ -1930,6 +1952,7 @@ impl LlamaSession {
                         self.config.max_sequences as usize,
                         self.context_extra_bytes,
                         prompt_batch_capacity(self.config.prefill_batch_size, self.max_context),
+                        self.weights.ctx.ro_region(),
                         &mut |_, _| {},
                     )?;
                     self.weights = weights;
@@ -3746,16 +3769,21 @@ fn build_runtime_state(
     carry_lanes: usize,
     context_extra_bytes: usize,
     prompt_batch_capacity: usize,
+    mapping: Option<&Arc<crate::MappedRegion>>,
     progress: &mut dyn FnMut(&str, f64),
 ) -> Result<(LoadedGgufWeights, SessionGraphSet)> {
     // Weights come from a read-only mmap of the gguf (clean file-backed
     // pages, lazy page-in); the fallback is the owned-arena path.
     let mut extra_bytes = context_extra_bytes;
     for attempt in 0..=MAX_GRAPH_RESERVE_RETRIES {
-        // Retries re-run this: remapping the same file is cheap, and only
-        // a real mapping failure may take the owned-arena fallback.
+        // Retries reuse an explicitly supplied verified mapping. Legacy callers
+        // may reopen the path; only that path allows owned-arena fallback.
         progress("load llm mmap", 0.130);
-        let mapped_weights = plan.full_weights.map_and_load(&model.gguf, extra_bytes);
+        let mapped_weights = if let Some(region) = mapping {
+            Some(plan.full_weights.load_from_mapped_region(&model.gguf, extra_bytes, region.clone())?)
+        } else {
+            plan.full_weights.map_and_load(&model.gguf, extra_bytes)
+        };
         let weight_gb = plan.full_weights.total_bytes as f64 / 1e9;
         let mut weights = match mapped_weights {
             Some(weights) => weights,

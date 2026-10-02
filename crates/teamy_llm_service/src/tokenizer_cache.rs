@@ -46,6 +46,12 @@ pub struct TokenizerCache {
 }
 
 impl TokenizerCache {
+    /// Validate through the same cache used by generation, retaining the exact parsed tokenizer.
+    /// Artifact inspection therefore does not parse and discard a second copy before encoding.
+    pub fn validate(&self, path: &Path) -> eyre::Result<()> {
+        self.get(path).map(|_| ())
+    }
+
     /// Return the unchanged tokenizer for this absolute path and current file stamp.
     ///
     /// This method does not change truncation, padding, special tokens or post-processing;
@@ -156,6 +162,35 @@ mod tests {
         assert_eq!(actual.get_ids(), expected.get_ids());
         assert_eq!(actual.get_ids(), &[3, 1]);
         assert_eq!(first.encode("hello", false).unwrap().get_ids(), &[1]);
+    }
+
+    #[test]
+    fn inspection_validation_retains_the_exact_tokenizer_used_for_encoding() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let path = directory.path().join("tokenizer.json");
+        write_fixture(&path, 1, false);
+        let cache = TokenizerCache::default();
+        cache.validate(&path).expect("inspection validation");
+        let key = std::path::absolute(&path).unwrap();
+        let validated = Arc::clone(&cache.entries.lock().unwrap().get(&key).unwrap().tokenizer);
+        let used_for_generation = cache.get(&path).expect("generation cache hit");
+        assert!(Arc::ptr_eq(&validated, &used_for_generation));
+        assert_eq!(
+            used_for_generation.encode("hello", true).unwrap().get_ids(),
+            &[3, 1]
+        );
+        assert_eq!(
+            used_for_generation
+                .encode("hello", false)
+                .unwrap()
+                .get_ids(),
+            &[1]
+        );
+
+        fs::write(&path, "invalid replacement tokenizer").unwrap();
+        assert!(cache.validate(&path).is_err());
+        assert!(cache.get(&path).is_err());
+        assert_eq!(validated.encode("hello", true).unwrap().get_ids(), &[3, 1]);
     }
 
     #[test]

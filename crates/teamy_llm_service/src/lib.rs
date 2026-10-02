@@ -14,7 +14,8 @@ use teamy_llm_burn_qwen35::burn_text::{
     score_continuation_with_cached_burn_text_runtime, verify_required_cuda_runtime,
 };
 use teamy_llm_burn_qwen35::model::{
-    DEFAULT_LLM_MODEL_NAME, LlmModelArtifacts, LlmModelPreparationState, inspect_model_dir,
+    DEFAULT_LLM_MODEL_NAME, LlmModelArtifacts, LlmModelPreparationState,
+    inspect_model_dir_with_tokenizer_validation, inspect_model_files,
     list_known_llm_model_statuses, prepare_burn_text_runtime_bundle, prepare_known_llm_model,
     render_model_report, resolve_llm_model_dir,
 };
@@ -26,8 +27,9 @@ use teamy_llm_core::{
     ServiceError, ServiceErrorKind, ServiceHealth, ThinkingMode,
 };
 pub use teamy_llm_makepad_gguf::ORCA_MODEL_NAME;
-use teamy_llm_makepad_gguf::{GgufGenerationOptions, GgufLoadOptions, GgufRuntime};
+use teamy_llm_makepad_gguf::{GgufGenerationOptions, GgufLoadOptions, GgufPreflight, GgufRuntime};
 
+mod cpu_preflight;
 mod model_defaults;
 mod qwen_chat;
 mod tokenizer_cache;
@@ -310,10 +312,20 @@ impl TeamyLlmService {
         };
 
         check_cancelled(cancellation_token.as_ref())?;
-        let artifacts = self.inspect_artifacts(&model_dir)?;
+        let (artifacts, gguf_preflight) = self.inspect_generation_artifacts(
+            &model_dir,
+            request.context_tokens,
+            cancellation_token.as_ref(),
+        )?;
         check_cancelled(cancellation_token.as_ref())?;
         if artifacts.metadata.model_name == ORCA_MODEL_NAME {
-            return self.generate_gguf(request, cancellation_token, &artifacts, sink);
+            return self.generate_gguf(
+                request,
+                cancellation_token,
+                &artifacts,
+                gguf_preflight,
+                sink,
+            );
         }
         if request.context_tokens.is_some() {
             return Err(ServiceError::new(
@@ -624,6 +636,7 @@ impl TeamyLlmService {
         request: GenerateRequest,
         cancellation: Option<CancellationToken>,
         artifacts: &LlmModelArtifacts,
+        preflight: Option<GgufPreflight>,
         sink: &mut impl GenerateEventSink,
     ) -> Result<GenerateResult, ServiceError> {
         let mut load_options = GgufLoadOptions::orca_qwen_q4(artifacts.model_path.clone());
@@ -711,8 +724,17 @@ impl TeamyLlmService {
                 let _span = tracing::info_span!("llm_load_runtime", provider = "makepad-gguf-cuda")
                     .entered();
                 let loaded = Arc::new(
-                    GgufRuntime::load(load_options, cancellation.clone().unwrap_or_default())
-                        .map_err(map_generation_error)?,
+                    match preflight {
+                        Some(prepared) => GgufRuntime::load_preflight(
+                            prepared,
+                            cancellation.clone().unwrap_or_default(),
+                        ),
+                        None => GgufRuntime::load(
+                            load_options,
+                            cancellation.clone().unwrap_or_default(),
+                        ),
+                    }
+                    .map_err(map_generation_error)?,
                 );
                 let audit = loaded.audit();
                 tracing::info!(device = %audit.actual_device_name, model_bytes = audit.model_bytes,
@@ -812,6 +834,80 @@ impl TeamyLlmService {
             .clone())
     }
 
+    fn inspect_generation_artifacts(
+        &self,
+        model_dir: &Path,
+        context_tokens: Option<u32>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(LlmModelArtifacts, Option<GgufPreflight>), ServiceError> {
+        // Structural inspection has an explicit API and never enters the validated cache.
+        let cached = self
+            .inspected_models
+            .lock()
+            .map_err(|_| {
+                ServiceError::new(ServiceErrorKind::Internal, "model cache mutex poisoned")
+            })?
+            .get(model_dir)
+            .cloned();
+        let artifacts = match cached {
+            Some(artifacts) => artifacts,
+            None => inspect_model_files(model_dir).map_err(|error| {
+                ServiceError::new(ServiceErrorKind::ModelNotPrepared, error.to_string())
+            })?,
+        };
+        if artifacts.metadata.model_name != ORCA_MODEL_NAME {
+            return self
+                .inspect_artifacts(model_dir)
+                .map(|artifacts| (artifacts, None));
+        }
+        let mut options = GgufLoadOptions::orca_qwen_q4(artifacts.model_path.clone());
+        if let Some(context) = context_tokens {
+            options.max_context = context;
+        }
+        let resident = self
+            .cached_gguf_runtimes
+            .lock()
+            .map_err(|_| {
+                ServiceError::new(
+                    ServiceErrorKind::Internal,
+                    "GGUF runtime cache mutex poisoned",
+                )
+            })?
+            .get(&artifacts.root)
+            .is_some_and(|runtime| runtime.audit().max_context == options.max_context);
+        let token = cancellation
+            .map(CancellationToken::child_token)
+            .unwrap_or_default();
+        let validate_tokenizer = || {
+            self.cached_tokenizers
+                .validate(&artifacts.tokenizer_path)
+                .map_err(|error| {
+                    ServiceError::new(ServiceErrorKind::ModelNotPrepared, error.to_string())
+                })
+        };
+        let preflight = if resident {
+            validate_tokenizer()?;
+            None
+        } else {
+            let worker_token = token.clone();
+            Some(cpu_preflight::validate_with_preflight(
+                &token,
+                move || {
+                    GgufRuntime::preflight(options, &worker_token).map_err(map_generation_error)
+                },
+                validate_tokenizer,
+            )?)
+        };
+        check_cancelled(Some(&token))?;
+        self.inspected_models
+            .lock()
+            .map_err(|_| {
+                ServiceError::new(ServiceErrorKind::Internal, "model cache mutex poisoned")
+            })?
+            .insert(model_dir.to_path_buf(), artifacts.clone());
+        Ok((artifacts, preflight))
+    }
+
     fn inspect_artifacts(&self, model_dir: &Path) -> Result<LlmModelArtifacts, ServiceError> {
         let cache_key = model_dir.to_path_buf();
         if let Some(artifacts) = self
@@ -825,7 +921,10 @@ impl TeamyLlmService {
         {
             return Ok(artifacts);
         }
-        let artifacts = inspect_model_dir(model_dir).map_err(|error| {
+        let artifacts = inspect_model_dir_with_tokenizer_validation(model_dir, |path| {
+            self.cached_tokenizers.validate(path)
+        })
+        .map_err(|error| {
             ServiceError::new(ServiceErrorKind::ModelNotPrepared, error.to_string())
         })?;
         self.inspected_models

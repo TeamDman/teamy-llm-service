@@ -142,6 +142,28 @@ impl GgufWeightLayout {
             }
         };
 
+        match self.load_from_mapped_region(gguf, extra_bytes, region) {
+            Ok(weights) => Some(weights),
+            Err(err) => {
+                eprintln!("llama: cannot map weight layout ({err}) — using the owned-arena weight path");
+                None
+            }
+        }
+    }
+
+    /// Reuse a caller's live immutable view, retaining its guard in the weight context.
+    /// The caller must bind this view to the parsed GGUF metadata and preserve backing bytes.
+    /// An explicit view mismatch is an error rather than a fallback to a reopened file.
+    pub fn load_from_mapped_region(
+        &self,
+        gguf: &GgufFile,
+        extra_bytes: usize,
+        region: Arc<MappedRegion>,
+    ) -> Result<LoadedGgufWeights> {
+        if u64::try_from(region.len()).ok() != Some(gguf.file_size) {
+            return Err(LlamaError::format("mapped weight view length differs from parsed GGUF"));
+        }
+
         // Lazy page-in makes the load look instant and hands the bill to
         // whoever touches the weights first — the first forward pass —
         // where it is paid at demand-fault speed. Measured on an M3 Max:
@@ -176,20 +198,10 @@ impl GgufWeightLayout {
         let mut ctx = Context::new_with_ro_region(region, dirty_size);
         let mut tensor_ids = BTreeMap::new();
         for tensor in &self.tensors {
-            match map_tensor_at_file_offset(&mut ctx, gguf, tensor) {
-                Ok(id) => {
-                    tensor_ids.insert(tensor.name.clone(), id);
-                }
-                Err(err) => {
-                    eprintln!(
-                        "llama: cannot map tensor '{}' ({}) — using the owned-arena weight path",
-                        tensor.name, err
-                    );
-                    return None;
-                }
-            }
+            let id = map_tensor_at_file_offset(&mut ctx, gguf, tensor)?;
+            tensor_ids.insert(tensor.name.clone(), id);
         }
-        Some(LoadedGgufWeights { ctx, tensor_ids })
+        Ok(LoadedGgufWeights { ctx, tensor_ids })
     }
 }
 

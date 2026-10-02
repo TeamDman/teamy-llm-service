@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "format": "ordered-raw-sha256-digests",
+  "whole_sha256": "3445102e9cde5d562508642c100a2f5ac3368a5a3f748442811d7a95daee3bec",
+  "total_bytes": 16810714496,
+  "chunk_bytes": 16777216,
+  "chunk_count": 1002,
+  "canonical_table_sha256": "4c5382f01047942fa3258670a54cd842754fa832bcd15d8e434a9fa99d4ddfd8",
+  "authoring_tool": "generate_chunk_table",
+  "authoring_policy": "The ordered chunk digests were generated from the same guarded byte stream whose ordinary whole-file SHA-256 matched the frozen artifact. The canonical table digest is independently pinned in application source. Runtime verification reads and hashes every chunk afresh; it does not trust mutable file stamps or disk receipts."
+}
