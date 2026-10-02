@@ -670,8 +670,7 @@ fn decision_summary(json: &str) -> String {
             .into();
     }
     let mut summary = format!(
-        "Chosen option: {}\nModel: {} / {} / {}\nOptions (input order; softmax is not calibrated confidence):\n",
-        bounded_prefix(&output.best_option_id, 512),
+        "Model: {} / {} / {}\nOptions (input order; softmax is not calibrated confidence):\n",
         bounded_prefix(&output.model, 512),
         bounded_prefix(&output.provider, 64),
         bounded_prefix(&output.device, 64)
@@ -690,7 +689,12 @@ fn decision_summary(json: &str) -> String {
             score.probability * 100.0
         ));
     }
-    summary.push_str("This choice is data; no option has been executed.");
+    // Results display the transcript tail, so keep the selected ID visible even
+    // when the viewport has only two lines of space.
+    summary.push_str(&format!(
+        "This choice is data; no option has been executed.\nChosen option: {}",
+        bounded_prefix(&output.best_option_id, 512)
+    ));
     summary
 }
 
@@ -1197,6 +1201,18 @@ mod tests {
         assert!(summary.find("wait: 25.00%").unwrap() < summary.find("heal: 75.00%").unwrap());
         assert!(summary.contains("not calibrated confidence"));
         assert!(!summary.contains("encoding-policy"));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 4)).unwrap();
+        terminal
+            .draw(|frame| render_tail(frame, frame.area(), &summary, "Decision"))
+            .unwrap();
+        let visible = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(visible.contains("Chosen option: heal"));
     }
 
     #[test]

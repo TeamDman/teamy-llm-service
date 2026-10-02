@@ -65,6 +65,7 @@ pub fn main() -> Result<()> {
         debug: cli.global_args.debug,
         filter: cli.global_args.log_filter.clone(),
         file: cli.global_args.log_file.clone(),
+        ansi: matches!(&cli.command, Command::Interactive(_)).then_some(false),
     };
     logging::install(
         &logging_options,

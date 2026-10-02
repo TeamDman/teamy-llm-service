@@ -19,6 +19,8 @@ pub struct LoggingOptions {
     pub debug: bool,
     pub filter: Option<String>,
     pub file: Option<PathBuf>,
+    /// Interactive panes render text themselves; ordinary terminal logs retain color.
+    pub ansi: Option<bool>,
 }
 
 impl LoggingOptions {
@@ -98,7 +100,7 @@ pub fn install(
     let stderr = tracing_subscriber::fmt::layer()
         .with_writer(crate::interactive::terminal_output::human_writer())
         .log_internal_errors(false)
-        .with_ansi(io::stderr().is_terminal())
+        .with_ansi(options.ansi.unwrap_or_else(|| io::stderr().is_terminal()))
         .with_span_events(FmtSpan::CLOSE)
         .with_filter(options.filter()?.and(keep_event()));
     let file_layer = if let Some(path) = &options.file {
