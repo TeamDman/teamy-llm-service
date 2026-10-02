@@ -20,6 +20,9 @@ color-eyre.workspace = true
 eyre.workspace = true
 humantime.workspace = true
 facet.workspace = true
+figue.workspace = true
+facet-pretty.workspace = true
+facet-csv.workspace = true
 facet-json.workspace = true
 teamy_llm_burn_julia.workspace = true
 teamy_llm_core.workspace = true
@@ -31,6 +34,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-tracy = { workspace = true, optional = true }
 tokio.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+teamy_llm_burn_qwen35.workspace = true

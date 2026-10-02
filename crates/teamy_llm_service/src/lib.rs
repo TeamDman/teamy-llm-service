@@ -28,8 +28,11 @@ use teamy_llm_core::{
 pub use teamy_llm_makepad_gguf::ORCA_MODEL_NAME;
 use teamy_llm_makepad_gguf::{GgufGenerationOptions, GgufLoadOptions, GgufRuntime};
 
+mod model_defaults;
 mod qwen_chat;
 mod tokenizer_cache;
+
+pub use model_defaults::ModelDefaultInfo;
 
 pub trait GenerateEventSink {
     fn send(&mut self, event: GenerateEvent) -> Result<(), ServiceError>;
@@ -153,6 +156,16 @@ impl TeamyLlmService {
         let statuses = list_known_llm_model_statuses(&self.app_home, &self.cache_home)
             .map_err(map_internal_error)?;
         Ok(statuses.into_iter().map(map_model_status).collect())
+    }
+
+    /// Report the explicit preference or the existing registered/built-in fallback.
+    pub fn default_model(&self) -> Result<ModelDefaultInfo, ServiceError> {
+        model_defaults::default_model(&self.app_home, &self.cache_home)
+    }
+
+    /// Select an existing, compatible managed model without changing registration order.
+    pub fn set_default_model(&self, model: &str) -> Result<ModelDefaultInfo, ServiceError> {
+        model_defaults::set_default_model(&self.app_home, &self.cache_home, model)
     }
 
     pub fn inspect_model(&self, selector: ModelSelector) -> Result<ModelReport, ServiceError> {
@@ -558,6 +571,13 @@ impl TeamyLlmService {
     }
 
     fn resolve_model_dir(&self, selector: &ModelSelector) -> Result<PathBuf, ServiceError> {
+        if selector.model.is_none()
+            && selector.model_dir.is_none()
+            && let Some(model_dir) =
+                model_defaults::explicit_model_dir(&self.app_home, &self.cache_home)?
+        {
+            return Ok(model_dir);
+        }
         resolve_llm_model_dir(
             &self.app_home,
             &self.cache_home,

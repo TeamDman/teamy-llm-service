@@ -12,9 +12,12 @@ V1 exposes Facet-serializable request/response/event models, extracts the Teamy-
 - `teamy_llm_burn_julia` and `teamy_llm_onnx_julia`: native and ONNX finite-choice providers.
 - `teamy_llm_makepad_gguf`: resident quantized CUDA generation with pinned weight and prompt-token checks.
 - `teamy_llm_service`: in-process service facade, model registry/cache, serialized per-model generation, and optional Vox trait/API.
-- `teamy_llm_cli`: local commands for health, model inspection/preparation, and prompt generation.
+- `teamy_llm_cli`: typed Figue commands, model preferences, batch inference and resident Ratatui sessions.
 
-The workspace pins `facet`, `figue`, and `vox` to the same TeamDman/facet git revision used by Cloud-Terrastodon.
+The workspace pins `facet`, `figue`, and `vox` to TeamDman/facet revision
+`d0c3140ec6683f80249d50d74fa073911e0dfeb9`. The CLI follows the typed command and
+module conventions demonstrated by `teamy-rust-cli` and Cloud-Terrastodon; those
+projects are structural prior art and have independent dependency pins.
 
 ## Finite-choice core contract
 
@@ -97,7 +100,7 @@ kernel.
 
 The CLI defaults to direct answers using each model's qualified prompt template. Use `--thinking`
 when deliberate reasoning is useful. Direct mode defaults to 256 new tokens; Thinking defaults to
-1,024 for the legacy model and 512 for explicitly named Orca selection. With an Orca `--model-dir`,
+1,024 for the legacy model and 512 for named or configured-default Orca selection. With an Orca `--model-dir`,
 set `--max-new-tokens` explicitly to leave room for the prompt. That flag overrides all defaults.
 
 ```text
@@ -110,19 +113,93 @@ first request. This reuses lazily populated GPU weight caches for later requests
 invalidates its cached runtime so updated weights are never reused.
 The service also caches tokenizers, reloading when file length or modification time changes.
 Runtime reuse requires the same service process; separate CLI prompt invocations remain cold.
-Switching between Burn and GGUF releases the competing runtime to limit GPU memory pressure.
+Switching between Burn and GGUF drops the competing runtime objects to limit GPU memory pressure.
+Allocator-held GPU memory can outlive those drops; interactive prompt/decision mode changes use an
+owned-process replacement to release the previous backend's residency.
+
+## Resident interactive inference
+
+Start a terminal session with an already prepared model:
+
+```powershell
+teamy-llm interactive --model qwen3.8-27b-uncensored-q4-k-m --max-new-tokens 64
+teamy-llm model default set qwen3.8-27b-uncensored-q4-k-m
+teamy-llm model default show
+teamy-llm model list --output-format text
+```
+
+Enter submits; Shift+Enter inserts a newline where supported. Ctrl+C or Esc cancels active
+work and quits when idle; Ctrl+Q quits. Tab switches to finite-choice mode when configured:
+
+```powershell
+teamy-llm interactive --model qwen3.8-27b-uncensored-q4-k-m --max-new-tokens 64 `
+  --decision-provider onnx --decision-model-dir ./models/julia `
+  --runtime-library ./runtime/onnxruntime.dll --device cuda --allow-cpu-fallback
+```
+
+The interface owns stderr and keeps one inference child resident within each mode. Its
+native diagnostics are captured, human logs are bounded and buffered, and optional NDJSON
+continues independently. Repeated prompts retain validated weights and tokenizers. Each
+prompt is still an independent turn; displayed history is not sent as conversation input.
+Switching prompt/decision modes replaces the child to release allocator-held GPU memory.
+Returning to a mode therefore loads its model again. Cancellation is cooperative.
+
+`--script ./sessions/repeat.json` exercises the same engine without terminal drawing,
+using bounded version1 actions and one typed JSON outcome per action. Request failures are
+shaped outcomes; invalid scripts, broken transports and shutdown failures exit nonzero.
+For two independent turns in one resident prompt worker, save this versioned input:
+
+```json
+{"version":1,"actions":[{"prompt":{"text":"Why is the sky blue?"}},{"prompt":{"text":"What causes a rainbow?"}}]}
+```
+
+```powershell
+teamy-llm interactive --model qwen3.8-27b-uncensored-q4-k-m --max-new-tokens 64 `
+  --script ./sessions/repeat.json
+```
+
+Prompt success is tagged `result.prompt.result`, containing the typed generation result.
+Decision success is tagged `result.decide.result`, containing `DecideOutput`; decision
+actions use `{"decide":{"request-json":"<serialized version 1 choice document>"}}`
+with an explicitly configured Julia provider. Optional `cancel-after-ms` requests
+cooperative cancellation. A cancelled action returns `result: null`, an `error` and
+`cancelled: true`; the worker can accept the next action.
+See [resident interactive inference](https://teamdman.github.io/teamy-docs/interactive-inference.html)
+and [terminal ownership](https://teamdman.github.io/teamy-docs/terminal-ownership.html).
+
+Model preferences use a separate atomic, versioned record. Preparation does not overwrite
+an explicit preference; explicit selectors bypass it. Interactive sessions snapshot their
+implicit selection at startup. Home/cache overrides follow the template, and all commands
+use generated Figue help, including inherited logging and cancellation options.
+Changing a default from another process does not change an open session's model or label;
+start another session to use the new preference.
+
+Session-script `elapsed-ms` measures parent time from before submission through its terminal reply,
+including a mode-change worker restart. `first-token-ms` uses that same parent start and records
+the first token event, which may contain empty text. Successful `worker-elapsed-ms` measures the
+child job separately, excluding parent restart and transport. The first action starts after the
+initial worker handshake, so these fields do not measure full CLI startup. The TUI currently
+starts its live busy timer after submission and reports worker duration on completion.
+
+Resident reuse does not add Windows mmap support. The pinned Makepad loader has a non-Unix
+mapping stub and uses an owned weight arena. Cold SHA-256 verification, disk staging and GPU
+session preparation remain. See the [Windows mmap explanation](https://teamdman.github.io/teamy-docs/local-text-generation.html#understand-the-windows-mmap-message).
 
 ## Performance baseline
 
 The benchmark command defaults to the fixed prompt `Why is the sky blue?`, a 200-token cap, and
-both native prompt modes. It prints one machine-readable row per mode:
+both native prompt modes. Its versioned report contains one row per request. Reports default
+to text on a terminal and JSON when redirected; `--output-format json` requests JSON explicitly:
 
-```text
-cargo run --release -p teamy_llm_cli -- benchmark --timeout-ms 600000
+```powershell
+.\scripts\cargo-cuda.ps1 -CargoArguments @(
+  'run', '--release', '--locked', '-p', 'teamy_llm_cli', '--',
+  'benchmark', '--timeout-ms', '600000'
+)
 ```
 
-`time_to_first_token_ms` starts when the request is submitted, so it includes model loading and
-prompt processing. `time_to_completion_ms` covers the entire request. `tokens_per_second` is the
+`time-to-first-token-ms` starts when the request is submitted, so it includes model loading and
+prompt processing. `time-to-completion-ms` covers the entire request. `tokens-per-second` is the
 token-event emission throughput (`(generated token count - 1) / (completion - first event)`). A first
 event can contain empty text, and the GGUF adapter can delay events for UTF-8 completion; these are
 end-to-end callback timings, not kernel-only decode or first-visible-text timings. Run each
@@ -138,8 +215,11 @@ the normal build has no Tracy dependency. Its client disables default features a
 Windows firewall exception. With the Tracy capture UI listening, enable it only for the profiling
 build:
 
-```text
-cargo run --release -p teamy_llm_cli --features tracy -- benchmark --no-thinking --max-new-tokens 64 --timeout-ms 600000
+```powershell
+.\scripts\cargo-cuda.ps1 -CargoArguments @(
+  'run', '--release', '--locked', '-p', 'teamy_llm_cli', '--features', 'tracy', '--',
+  'benchmark', '--no-thinking', '--max-new-tokens', '64', '--timeout-ms', '600000'
+)
 ```
 
 Save the resulting `.tracy` capture, then use the local `teamy-profiler` repository to rank the

@@ -2,9 +2,11 @@
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
-use eyre::{Result, bail, ensure};
+#[cfg(test)]
+use eyre::ensure;
+use eyre::{Result, bail};
 use teamy_cancellation::{CancellationToken, StopAfterArgs};
 use tracing_subscriber::filter::FilterExt;
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -20,6 +22,7 @@ pub struct LoggingOptions {
 }
 
 impl LoggingOptions {
+    #[cfg(test)]
     pub fn extract(args: &mut Vec<String>) -> Result<Self> {
         let mut result = Self::default();
         let mut cursor = 0;
@@ -71,7 +74,7 @@ impl LoggingOptions {
         Ok(EnvFilter::try_new(value)?)
     }
 
-    fn filter_directive(&self, inherited: Option<&str>) -> String {
+    pub(crate) fn filter_directive(&self, inherited: Option<&str>) -> String {
         if let Some(explicit) = &self.filter {
             explicit.clone()
         } else if self.debug {
@@ -93,7 +96,8 @@ pub fn install(
         })
     };
     let stderr = tracing_subscriber::fmt::layer()
-        .with_writer(io::stderr)
+        .with_writer(crate::interactive::terminal_output::human_writer())
+        .log_internal_errors(false)
         .with_ansi(io::stderr().is_terminal())
         .with_span_events(FmtSpan::CLOSE)
         .with_filter(options.filter()?.and(keep_event()));
@@ -127,8 +131,21 @@ pub fn install(
         EnvFilter::try_new("trace,cranelift_codegen=warn,cubecl=info")?,
     ));
     tracing::subscriber::set_global_default(subscriber)?;
+    // The child captures native stderr as well as tracing. Only the parent
+    // opens an optional NDJSON destination; no environment mutation is needed.
+    let _ = WORKER_FILTER.set(options.filter_directive(std::env::var("RUST_LOG").ok().as_deref()));
+    let _ = WORKER_STOP_AFTER.set(stop_after.stop_after_span.clone());
     tracing::debug!(debug = options.debug, "diagnostic logging initialized");
     Ok(())
+}
+
+static WORKER_FILTER: OnceLock<String> = OnceLock::new();
+pub(crate) fn worker_filter() -> Option<&'static str> {
+    WORKER_FILTER.get().map(String::as_str)
+}
+static WORKER_STOP_AFTER: OnceLock<Option<String>> = OnceLock::new();
+pub(crate) fn worker_stop_after() -> Option<&'static str> {
+    WORKER_STOP_AFTER.get().and_then(Option::as_deref)
 }
 
 #[cfg(test)]

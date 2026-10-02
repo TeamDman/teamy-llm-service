@@ -9,7 +9,10 @@ publish = false
 
 [dependencies]
 eyre.workspace = true
+facet.workspace = true
+facet-json.workspace = true
 humantime.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 vox = { workspace = true, optional = true }
@@ -19,8 +22,8 @@ teamy_llm_makepad_gguf.workspace = true
 teamy-cancellation.workspace = true
 tokenizers.workspace = true
 
-[dev-dependencies]
-tempfile.workspace = true
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 [features]
 default = []
