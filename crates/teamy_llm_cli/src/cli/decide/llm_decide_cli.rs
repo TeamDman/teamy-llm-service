@@ -14,6 +14,7 @@ use teamy_llm_burn_julia::{NativeDevice, NativeJuliaMetadata, NativeJuliaProvide
 use teamy_llm_core::ModelSelector;
 use teamy_llm_core::finite_choice::{
     ChoiceContent, FiniteChoiceOption, FiniteChoiceRequest, FiniteChoiceResult,
+    PROBABILITY_TOLERANCE,
 };
 use teamy_llm_julia_common::{
     EncodedJuliaRequest, EncodingPolicy, JuliaEncoder, julia_capabilities,
@@ -89,25 +90,33 @@ impl DecisionDevice {
 
 /// Choose between 2–20 text options using the independently qualified Julia-1 model.
 ///
-/// Input is version 1 JSON: input {text, visuals: []}, options [{id, content:
-/// {text, visuals: []}}], optional model and question. Images are rejected.
+/// Supply text with --prompt and 2–20 repeated --choice flags. Images are unsupported.
 /// --request accepts quoted '@file', '-' for stdin, or inline JSON. Omitted
-/// --request reads piped UTF-8 stdin, bounded to 2 MiB. Output is versioned JSON.
+/// --request reads piped UTF-8 stdin, bounded to 2 MiB. JSON requests produce JSON.
+/// Alternatively, --prompt text and repeated --choice text produce one probability
+/// per line in the supplied order. --prompt - reads UTF-8 stdin; --output-format
+/// json selects the complete structured result. These input modes cannot be mixed.
 /// CUDA never silently falls back. Executing GPU kernels cannot be preempted.
 #[derive(Debug, Clone, PartialEq, Eq, Facet)]
 pub struct DecideCli {
     /// Request source: '@file', '-', or inline JSON; omitted means piped stdin.
     #[facet(args::named)]
     pub request: Option<String>,
-    /// Explicit qualified backend: native or onnx.
+    /// Text to evaluate, or - to read bounded UTF-8 stdin.
     #[facet(args::named)]
+    pub prompt: Option<String>,
+    /// Repeat --choice for each of 2–20 text options, preserving supplied order.
+    #[facet(args::named, default)]
+    pub choice: Vec<String>,
+    /// Qualified backend: native (default) or onnx.
+    #[facet(args::named, default = DecisionProvider::Native)]
     pub provider: DecisionProvider,
     /// julia-1, or a matching model field in the JSON request.
     #[facet(args::named)]
     pub model: Option<String>,
-    /// Existing locally acquired Julia artifact directory.
+    /// Existing Julia directory; native defaults to its separately recorded location.
     #[facet(args::named)]
-    pub model_dir: PathBuf,
+    pub model_dir: Option<PathBuf>,
     /// Explicit compute device; no automatic fallback.
     #[facet(args::named, default = DecisionDevice::Cuda)]
     pub device: DecisionDevice,
@@ -137,7 +146,22 @@ pub struct DecideCli {
     pub profile_prefix: Option<PathBuf>,
 }
 impl DecideCli {
+    pub fn uses_text_input(&self) -> bool {
+        self.prompt.is_some() || !self.choice.is_empty()
+    }
+
     pub fn validate(&self) -> Result<()> {
+        if self.uses_text_input() {
+            ensure!(
+                self.request.is_none(),
+                "--prompt/--choice cannot be combined with --request"
+            );
+            let prompt = self
+                .prompt
+                .as_deref()
+                .ok_or_else(|| eyre!("--choice requires --prompt text or --prompt -"))?;
+            validate_text_input(prompt, &self.choice)?;
+        }
         ensure!(
             (1..=1000).contains(&self.repeat),
             "--repeat must be in 1..=1000"
@@ -192,14 +216,17 @@ impl DecideCli {
     pub fn for_interactive(args: &crate::cli::interactive::InteractiveCli) -> Result<Self> {
         let options = Self {
             request: None,
+            prompt: None,
+            choice: Vec::new(),
             provider: args.decision_provider.ok_or_else(|| {
                 eyre!("interactive decisions require --decision-provider native|onnx")
             })?,
             model: Some("julia-1".into()),
-            model_dir: args
-                .decision_model_dir
-                .clone()
-                .ok_or_else(|| eyre!("interactive decisions require --decision-model-dir"))?,
+            model_dir: Some(
+                args.decision_model_dir
+                    .clone()
+                    .ok_or_else(|| eyre!("interactive decisions require --decision-model-dir"))?,
+            ),
             device: args.device,
             runtime_library: args.runtime_library.clone(),
             question: None,
@@ -221,6 +248,7 @@ impl DecideCli {
 /// Executing GPU kernels cannot be preempted.
 pub struct DecisionEngine {
     options: DecideCli,
+    model_dir: Option<PathBuf>,
     encoder: Option<(EncodingPolicy, JuliaEncoder)>,
     resident: Option<ResidentDecision>,
 }
@@ -234,6 +262,7 @@ impl DecisionEngine {
         options.validate()?;
         Ok(Self {
             options,
+            model_dir: None,
             encoder: None,
             resident: None,
         })
@@ -265,7 +294,11 @@ impl DecisionEngine {
         let request = FiniteChoiceRequest {
             selector: ModelSelector {
                 model: Some(model.clone()),
-                model_dir: Some(self.options.model_dir.display().to_string()),
+                model_dir: self
+                    .options
+                    .model_dir
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
             },
             input: wire.input,
             options: wire.options,
@@ -273,6 +306,12 @@ impl DecisionEngine {
         // Capability checks still precede tokenizer and numerical artifact reads.
         let validated = request.validate_for(&julia_capabilities())?;
         cancellation.bail_if_cancelled()?;
+        if self.model_dir.is_none() {
+            self.model_dir = Some(super::model_dir::resolve(
+                self.options.model_dir.as_deref(),
+                self.options.provider,
+            )?);
+        }
         if self
             .encoder
             .as_ref()
@@ -280,7 +319,10 @@ impl DecisionEngine {
         {
             self.encoder = Some((
                 policy.clone(),
-                JuliaEncoder::load(&self.options.model_dir, policy.clone())?,
+                JuliaEncoder::load(
+                    self.model_dir.as_deref().expect("resolved Julia directory"),
+                    policy.clone(),
+                )?,
             ));
         }
         let encoding = self
@@ -385,8 +427,12 @@ impl DecisionEngine {
             } else {
                 NativeDevice::Cpu
             };
-            let provider =
-                NativeJuliaProvider::load(&self.options.model_dir, device, policy, cancellation)?;
+            let provider = NativeJuliaProvider::load(
+                self.model_dir.as_deref().expect("resolved Julia directory"),
+                device,
+                policy,
+                cancellation,
+            )?;
             let metadata = provider.metadata().clone();
             Ok(ResidentDecision {
                 provider: Provider::Native(Box::new(provider)),
@@ -396,7 +442,7 @@ impl DecisionEngine {
         } else {
             let provider = JuliaOnnxProvider::load(
                 JuliaOnnxOptions {
-                    model_dir: self.options.model_dir.clone(),
+                    model_dir: self.model_dir.clone().expect("resolved Julia directory"),
                     runtime_library: self
                         .options
                         .runtime_library
@@ -497,29 +543,368 @@ fn read_request(source: Option<String>, cancellation: &CancellationToken) -> Res
     }
 }
 
+fn validate_text_input(prompt: &str, choices: &[String]) -> Result<()> {
+    ensure!(!prompt.trim().is_empty(), "--prompt must contain text");
+    ensure!(
+        prompt.len() <= MAX_REQUEST_BYTES,
+        "prompt exceeds 2 MiB limit"
+    );
+    ensure!(
+        (2..=20).contains(&choices.len()),
+        "text decisions require 2–20 --choice values"
+    );
+    ensure!(
+        choices.iter().all(|choice| !choice.trim().is_empty()),
+        "--choice values must contain text"
+    );
+    Ok(())
+}
+
+fn text_request(
+    prompt: String,
+    choices: &[String],
+    model: Option<String>,
+    question: Option<String>,
+) -> Result<DecideRequest> {
+    validate_text_input(&prompt, choices)?;
+    Ok(DecideRequest {
+        version: 1,
+        // Text decisions use Julia independently of prompt's configured text
+        // generation model. Explicit selection still goes through the engine.
+        model: model.or_else(|| Some("julia-1".into())),
+        question,
+        input: ChoiceContent::text(prompt),
+        options: choices
+            .iter()
+            .enumerate()
+            .map(|(index, choice)| FiniteChoiceOption {
+                // IDs identify positions, so duplicate labels remain distinct.
+                id: format!("choice-{}", index + 1),
+                content: ChoiceContent::text(choice.clone()),
+            })
+            .collect(),
+    })
+}
+
+fn write_probabilities(
+    writer: &mut (impl Write + ?Sized),
+    result: &FiniteChoiceResult,
+    option_count: usize,
+) -> Result<()> {
+    ensure!(
+        (2..=20).contains(&option_count) && result.scores.len() == option_count,
+        "probability count must match the supplied choices"
+    );
+    for (index, score) in result.scores.iter().enumerate() {
+        ensure!(
+            score.option_id == format!("choice-{}", index + 1),
+            "probabilities must preserve the supplied choice order"
+        );
+        ensure!(
+            score.logit.is_finite()
+                && score.probability.is_finite()
+                && (0.0..=1.0).contains(&score.probability),
+            "choice scores must be finite probabilities in [0, 1]"
+        );
+    }
+    let sum: f64 = result.scores.iter().map(|score| score.probability).sum();
+    ensure!(
+        (sum - 1.0).abs() <= PROBABILITY_TOLERANCE,
+        "choice probabilities must sum to one"
+    );
+    // Validate every row before the first write; malformed results must not
+    // leave a partial list that looks like a valid subset of the choices.
+    for score in &result.scores {
+        writeln!(writer, "{}", score.probability)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_json(writer: &mut (impl Write + ?Sized), output: &DecideOutput) -> Result<()> {
+    let encoded = facet_json::to_string(output)?;
+    writeln!(writer, "{encoded}")?;
+    writer.flush()?;
+    Ok(())
+}
+
 pub fn run(
     mut options: DecideCli,
     output_format: Option<OutputFormat>,
     cancellation: CancellationToken,
 ) -> Result<()> {
+    let text_mode = options.uses_text_input();
+    let output_format = output_format.unwrap_or(if text_mode {
+        OutputFormat::Text
+    } else {
+        OutputFormat::Json
+    });
     ensure!(
-        output_format.is_none_or(|format| format == OutputFormat::Json),
-        "decide currently supports only JSON output"
+        output_format == OutputFormat::Json || (text_mode && output_format == OutputFormat::Text),
+        "decide supports JSON, or text probabilities with --prompt/--choice"
     );
     options.validate()?;
-    let bytes = read_request(options.request.take(), &cancellation)?;
+    let bytes = if text_mode {
+        let source = options.prompt.take().expect("validated text prompt");
+        let prompt = if source == "-" {
+            String::from_utf8(read_request(Some(source), &cancellation)?)
+                .wrap_err("stdin prompt must be valid UTF-8")?
+        } else {
+            source
+        };
+        let request = text_request(
+            prompt,
+            &options.choice,
+            options.model.clone(),
+            options.question.clone(),
+        )?;
+        // Once translated, both transports follow exactly the same validated
+        // numerical engine and capability checks.
+        let bytes = facet_json::to_string(&request)?.into_bytes();
+        options.choice.clear();
+        bytes
+    } else {
+        read_request(options.request.take(), &cancellation)?
+    };
     let mut engine = DecisionEngine::new(options)?;
     let output = engine.evaluate_json(&bytes, cancellation.clone())?;
-    let encoded = facet_json::to_string(&output)?;
     cancellation.bail_if_cancelled()?;
-    writeln!(io::stdout().lock(), "{encoded}")?;
-    Ok(())
+    let mut stdout = io::stdout().lock();
+    match output_format {
+        OutputFormat::Text => write_probabilities(&mut stdout, &output.result, output.option_count),
+        OutputFormat::Json => write_json(&mut stdout, &output),
+        OutputFormat::Csv => unreachable!("validated output format"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use teamy_llm_core::finite_choice::FiniteChoiceScore;
     const VALID: &str = r#"{"version":1,"model":"julia-1","input":{"text":"Sort a note","visuals":[]},"options":[{"id":"writing","content":{"text":"Writing programs","visuals":[]}},{"id":"playing","content":{"text":"Playing games","visuals":[]}}]}"#;
+
+    fn parse_decide(arguments: &[&str]) -> DecideCli {
+        let cli = crate::cli::parse(arguments.iter().copied())
+            .into_result()
+            .unwrap();
+        let crate::cli::Command::Decide(options) = cli.value.command else {
+            panic!("decide command")
+        };
+        options
+    }
+
+    fn synthetic_output() -> DecideOutput {
+        DecideOutput {
+            version: 1,
+            task: "finite-choice".into(),
+            model: "julia-1".into(),
+            provider: "native".into(),
+            device: "cuda".into(),
+            question: EncodingPolicy::default().question,
+            encoding_policy: EncodingPolicy::default(),
+            token_count: 1,
+            option_count: 2,
+            load_ms: 0.0,
+            inference_ms: vec![1.0],
+            best_option_id: "choice-2".into(),
+            result: FiniteChoiceResult {
+                scores: vec![
+                    FiniteChoiceScore {
+                        option_id: "choice-1".into(),
+                        logit: 0.25_f64.ln(),
+                        probability: 0.25,
+                    },
+                    FiniteChoiceScore {
+                        option_id: "choice-2".into(),
+                        logit: 0.75_f64.ln(),
+                        probability: 0.75,
+                    },
+                ],
+            },
+            encoding: None,
+            onnx_audit: None,
+            native_metadata: None,
+            profiling_file: None,
+        }
+    }
+
+    #[test]
+    fn repeated_choice_flags_preserve_order_unicode_and_duplicate_labels() {
+        let options = parse_decide(&[
+            "decide",
+            "--model-dir",
+            "synthetic-model",
+            "--model",
+            "julia-1",
+            "--prompt",
+            "  Où ranger café ?\n",
+            "--choice",
+            "β",
+            "--choice",
+            "café",
+            "--choice",
+            "β",
+        ]);
+        options.validate().unwrap();
+        assert_eq!(options.provider, DecisionProvider::Native);
+        assert_eq!(options.choice, ["β", "café", "β"]);
+        let request = text_request(
+            options.prompt.unwrap(),
+            &options.choice,
+            options.model,
+            options.question,
+        )
+        .unwrap();
+        assert_eq!(request.input.text.as_deref(), Some("  Où ranger café ?\n"));
+        assert_eq!(request.options[0].id, "choice-1");
+        assert_eq!(request.options[2].id, "choice-3");
+        assert_eq!(request.options[2].content.text.as_deref(), Some("β"));
+        let encoded = facet_json::to_string(&request).unwrap();
+        let decoded = decode_request(encoded.as_bytes()).unwrap();
+        assert_eq!(decoded.options, request.options);
+        assert_eq!(decoded.input, request.input);
+        FiniteChoiceRequest {
+            selector: ModelSelector::default(),
+            input: decoded.input,
+            options: decoded.options,
+        }
+        .validate_for(&julia_capabilities())
+        .unwrap();
+    }
+
+    #[test]
+    fn text_flags_reject_mixed_transport_missing_fields_and_empty_labels() {
+        for input_flags in [
+            vec!["--prompt", "text"],
+            vec!["--choice", "a", "--choice", "b"],
+            vec!["--prompt", "", "--choice", "a", "--choice", "b"],
+            vec!["--prompt", "text", "--choice", "a", "--choice", " "],
+            vec![
+                "--request",
+                VALID,
+                "--prompt",
+                "text",
+                "--choice",
+                "a",
+                "--choice",
+                "b",
+            ],
+        ] {
+            let mut arguments = vec!["decide", "--model-dir", "synthetic-model"];
+            arguments.extend(input_flags);
+            assert!(parse_decide(&arguments).validate().is_err());
+        }
+        for count in [0, 1, 21] {
+            let choices = vec!["option".to_owned(); count];
+            assert!(text_request("text".into(), &choices, None, None).is_err());
+        }
+        for count in [2, 20] {
+            let choices = vec!["option".to_owned(); count];
+            assert!(text_request("text".into(), &choices, None, None).is_ok());
+        }
+        assert!(text_request("\n\t".into(), &["a".into(), "b".into()], None, None).is_err());
+    }
+
+    #[test]
+    fn explicit_dash_selects_text_stdin_without_changing_choice_order() {
+        let options = parse_decide(&[
+            "decide",
+            "--model-dir",
+            "synthetic-model",
+            "--prompt",
+            "-",
+            "--choice",
+            "a",
+            "--choice",
+            "b",
+        ]);
+        options.validate().unwrap();
+        assert_eq!(options.prompt.as_deref(), Some("-"));
+        assert_eq!(options.choice, ["a", "b"]);
+        let prompt = "  café\n$(not-a-command)\r\n";
+        let bytes = read_bounded(prompt.as_bytes(), &CancellationToken::default()).unwrap();
+        let decoded = String::from_utf8(bytes).unwrap();
+        let request = text_request(decoded, &options.choice, None, None).unwrap();
+        assert_eq!(request.input.text.as_deref(), Some(prompt));
+        assert_eq!(request.model.as_deref(), Some("julia-1"));
+    }
+
+    #[test]
+    fn probability_lines_preserve_choice_order_and_prevalidate_all_rows() {
+        let output = synthetic_output();
+        let mut bytes = Vec::new();
+        write_probabilities(&mut bytes, &output.result, output.option_count).unwrap();
+        assert_eq!(bytes, b"0.25\n0.75\n");
+
+        let mut precise = output.result.clone();
+        precise.scores[0].probability = 0.000_000_001;
+        precise.scores[1].probability = 0.999_999_999;
+        bytes.clear();
+        write_probabilities(&mut bytes, &precise, output.option_count).unwrap();
+        assert_eq!(bytes, b"0.000000001\n0.999999999\n");
+
+        let mut invalid = output.result.clone();
+        invalid.scores[1].probability = f64::NAN;
+        bytes.clear();
+        assert!(write_probabilities(&mut bytes, &invalid, output.option_count).is_err());
+        assert!(bytes.is_empty());
+        invalid = output.result.clone();
+        invalid.scores.swap(0, 1);
+        assert!(write_probabilities(&mut bytes, &invalid, output.option_count).is_err());
+        assert!(bytes.is_empty());
+        invalid = output.result.clone();
+        invalid.scores[1].probability = 0.5;
+        assert!(write_probabilities(&mut bytes, &invalid, output.option_count).is_err());
+        assert!(bytes.is_empty());
+        assert!(write_probabilities(&mut bytes, &output.result, 3).is_err());
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn structured_decision_json_retains_ids_order_and_metadata() {
+        let output = synthetic_output();
+        let mut bytes = Vec::new();
+        write_json(&mut bytes, &output).unwrap();
+        assert!(bytes.ends_with(b"\n"));
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let decoded: DecideOutput = facet_json::from_str(text).unwrap();
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.option_count, 2);
+        assert_eq!(decoded.result, output.result);
+        assert_eq!(decoded.provider, "native");
+        assert_eq!(decoded.inference_ms, [1.0]);
+    }
+
+    #[test]
+    fn text_and_json_output_propagate_writer_and_flush_failures() {
+        struct FailingWriter {
+            fail_write: bool,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.fail_write {
+                    Err(io::Error::other("closed sink"))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("cannot flush sink"))
+            }
+        }
+        let output = synthetic_output();
+        for fail_write in [true, false] {
+            assert!(
+                write_probabilities(
+                    &mut FailingWriter { fail_write },
+                    &output.result,
+                    output.option_count
+                )
+                .is_err()
+            );
+            assert!(write_json(&mut FailingWriter { fail_write }, &output).is_err());
+        }
+    }
     #[test]
     fn request_transport_preserves_ids_and_rejects_schema_drift() {
         let parsed = decode_request(VALID.as_bytes()).unwrap();

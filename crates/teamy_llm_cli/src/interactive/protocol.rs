@@ -36,12 +36,20 @@ impl TryFrom<&DecideCli> for DecisionConfig {
     type Error = eyre::Report;
 
     fn try_from(options: &DecideCli) -> Result<Self> {
+        ensure!(
+            !options.uses_text_input(),
+            "interactive decision configuration cannot contain transient --prompt/--choice input"
+        );
+        let model_dir = options
+            .model_dir
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("interactive decisions require an explicit model-dir"))?;
         options.validate()?;
         Ok(Self {
             request: options.request.clone(),
             provider: options.provider,
             model: options.model.clone(),
-            model_dir: path_string(&options.model_dir, "model-dir")?,
+            model_dir: path_string(model_dir, "model-dir")?,
             device: options.device,
             runtime_library: options
                 .runtime_library
@@ -68,9 +76,11 @@ impl DecisionConfig {
     pub fn into_cli(self) -> Result<DecideCli> {
         let options = DecideCli {
             request: self.request,
+            prompt: None,
+            choice: Vec::new(),
             provider: self.provider,
             model: self.model,
-            model_dir: string_path(self.model_dir, "model-dir")?,
+            model_dir: Some(string_path(self.model_dir, "model-dir")?),
             device: self.device,
             runtime_library: self
                 .runtime_library
@@ -338,9 +348,11 @@ mod tests {
     fn decision_options(provider: DecisionProvider) -> DecideCli {
         DecideCli {
             request: Some(r#"{"version":1}"#.into()),
+            prompt: None,
+            choice: Vec::new(),
             provider,
             model: Some("julia-1".into()),
-            model_dir: PathBuf::from(r"fixtures\Julia café 日本語"),
+            model_dir: Some(PathBuf::from(r"fixtures\Julia café 日本語")),
             device: DecisionDevice::Cuda,
             runtime_library: (provider == DecisionProvider::Onnx)
                 .then(|| PathBuf::from(r"fixtures\CUDA runtime 日本語\onnxruntime.dll")),
@@ -409,7 +421,7 @@ mod tests {
     #[test]
     fn decision_transport_rejects_nul_paths_before_runtime_construction() {
         let mut options = decision_options(DecisionProvider::Native);
-        options.model_dir = PathBuf::from("fixture\0model");
+        options.model_dir = Some(PathBuf::from("fixture\0model"));
         assert!(DecisionConfig::try_from(&options).is_err());
         let mut config =
             DecisionConfig::try_from(&decision_options(DecisionProvider::Onnx)).unwrap();
@@ -431,7 +443,7 @@ mod tests {
             PathBuf::from(std::ffi::OsString::from_wide(&[0xd800]))
         };
         let mut options = decision_options(DecisionProvider::Native);
-        options.model_dir = invalid.clone();
+        options.model_dir = Some(invalid.clone());
         assert!(DecisionConfig::try_from(&options).is_err());
         let mut options = decision_options(DecisionProvider::Onnx);
         options.runtime_library = Some(invalid.clone());
@@ -439,6 +451,33 @@ mod tests {
         options.runtime_library = Some(PathBuf::from("fixture/runtime.dll"));
         options.profile_prefix = Some(invalid);
         assert!(DecisionConfig::try_from(&options).is_err());
+    }
+
+    #[test]
+    fn decision_transport_requires_an_explicit_artifact_directory() {
+        let mut options = decision_options(DecisionProvider::Native);
+        options.model_dir = None;
+        let error = DecisionConfig::try_from(&options).unwrap_err();
+        assert!(error.to_string().contains("explicit model-dir"));
+    }
+
+    #[test]
+    fn decision_transport_rejects_transient_text_input_without_dropping_it() {
+        for (prompt, choice) in [
+            (Some("question".into()), Vec::new()),
+            (None, vec!["first".into(), "second".into()]),
+            (
+                Some("question".into()),
+                vec!["first".into(), "second".into()],
+            ),
+        ] {
+            let mut options = decision_options(DecisionProvider::Native);
+            options.request = None;
+            options.prompt = prompt;
+            options.choice = choice;
+            let error = DecisionConfig::try_from(&options).unwrap_err();
+            assert!(error.to_string().contains("transient --prompt/--choice"));
+        }
     }
 
     #[test]

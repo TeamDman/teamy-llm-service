@@ -25,6 +25,7 @@ facet-pretty.workspace = true
 facet-csv.workspace = true
 facet-json.workspace = true
 teamy_llm_burn_julia.workspace = true
+teamy_llm_burn_qwen35.workspace = true
 teamy_llm_core.workspace = true
 teamy_llm_julia_common.workspace = true
 teamy_llm_onnx_julia.workspace = true
@@ -42,7 +43,6 @@ vox.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-teamy_llm_burn_qwen35.workspace = true
 
 [lints.rust]
 unfulfilled_lint_expectations = "deny"

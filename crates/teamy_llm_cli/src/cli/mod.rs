@@ -213,10 +213,7 @@ mod tests {
     }
     #[test]
     fn missing_required_arguments_fail_while_requested_help_succeeds() {
-        for arguments in [
-            vec!["decide", "--provider", "native"],
-            vec!["model", "default", "set"],
-        ] {
+        for arguments in [vec!["decide", "--prompt"], vec!["model", "default", "set"]] {
             assert!(
                 matches!(
                     parse(arguments).unwrap_err(),
@@ -413,6 +410,90 @@ mod tests {
             };
             assert_eq!(options.request.as_deref(), Some(request));
             options.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn decide_repeated_choices_preserve_literals_duplicates_and_input_order() {
+        let values = [
+            "?",
+            "-?",
+            "help",
+            "--help",
+            "--debug",
+            "--version",
+            "--",
+            "café 日本語",
+            "line one\nline two",
+            "key=value",
+            "?",
+        ];
+        let mut arguments = vec!["decide", "--prompt", "ordinary question"];
+        for value in values {
+            arguments.extend(["--choice", value]);
+        }
+        let cli = parsed(&arguments).unwrap();
+        assert!(!cli.global_args.debug);
+        assert!(!cli.builtins.help);
+        assert!(!cli.builtins.version);
+        let Command::Decide(options) = cli.command else {
+            panic!("decide")
+        };
+        assert_eq!(options.prompt.as_deref(), Some("ordinary question"));
+        assert_eq!(options.choice, values.map(String::from));
+        assert!(options.model_dir.is_none());
+        assert_eq!(
+            options.provider,
+            crate::cli::decide::DecisionProvider::Native
+        );
+        options.validate().unwrap();
+    }
+
+    #[test]
+    fn decide_named_prompt_values_and_inline_choices_remain_literal_data() {
+        for value in [
+            "?",
+            "-?",
+            "help",
+            "--help",
+            "--debug",
+            "--version",
+            "--",
+            "café 日本語\nsecond line",
+        ] {
+            let cli =
+                parsed(&["decide", "--prompt", value, "--choice=?", "--choice=--help"]).unwrap();
+            assert!(!cli.global_args.debug);
+            assert!(!cli.builtins.help);
+            assert!(!cli.builtins.version);
+            let Command::Decide(options) = cli.command else {
+                panic!("decide")
+            };
+            assert_eq!(options.prompt.as_deref(), Some(value));
+            assert_eq!(options.choice, ["?", "--help"]);
+            options.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn decide_rejects_duplicate_prompt_and_unknown_flags() {
+        for arguments in [
+            vec![
+                "decide", "--prompt", "first", "--prompt", "second", "--choice", "a", "--choice",
+                "b",
+            ],
+            vec![
+                "decide",
+                "--prompt",
+                "question",
+                "--choice",
+                "a",
+                "--choice",
+                "b",
+                "--unknown",
+            ],
+        ] {
+            assert!(parsed(&arguments).is_err(), "{arguments:?}");
         }
     }
     #[test]
