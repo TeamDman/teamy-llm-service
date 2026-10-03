@@ -11,5 +11,7 @@ publish = false
 eyre.workspace = true
 facet.workspace = true
 facet-json.workspace = true
+serde = "=1.0.228"
 teamy_llm_core.workspace = true
 tokenizers.workspace = true
+tracing.workspace = true

@@ -4,7 +4,7 @@
 //! Inference uses batch one and the publisher's padding-to-eight collator. This module
 //! does not load numerical weights, infer, acquire artifacts or silently discard images.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use eyre::{WrapErr, ensure};
 use facet::Facet;
@@ -12,7 +12,21 @@ use teamy_llm_core::finite_choice::{
     BackendCapabilities, FiniteChoiceCapabilities, FiniteChoiceError, FiniteChoiceErrorKind,
     ValidatedFiniteChoiceRequest,
 };
-use tokenizers::Tokenizer;
+use tokenizers::{
+    DecoderWrapper, NormalizerWrapper, PostProcessorWrapper, PreTokenizerWrapper, Tokenizer,
+    TokenizerImpl,
+};
+
+mod streaming_bpe;
+use streaming_bpe::StreamingBpe;
+
+type BpeTokenizer = TokenizerImpl<
+    StreamingBpe,
+    NormalizerWrapper,
+    PreTokenizerWrapper,
+    PostProcessorWrapper,
+    DecoderWrapper,
+>;
 
 pub const JULIA_MODEL_REVISION: &str = "a85b127321d580d65176c89ced8273f305745d85";
 pub const JULIA_ONNX_REVISION: &str = "82a2fadf8fccfccdc5fd4e1009ba8f1a265eb7a8";
@@ -184,13 +198,16 @@ pub fn julia_capabilities() -> BackendCapabilities {
     }
 }
 
+/// Clones share the parsed tokenizer while retaining their own encoding policy.
+#[derive(Clone)]
 pub struct JuliaEncoder {
-    tokenizer: Tokenizer,
+    tokenizer: Arc<Tokenizer>,
     policy: EncodingPolicy,
     special_literals: Vec<String>,
 }
 
 impl JuliaEncoder {
+    #[tracing::instrument(level = "debug", name = "julia_tokenizer_load", skip_all)]
     pub fn load(model_dir: &Path, policy: EncodingPolicy) -> eyre::Result<Self> {
         // The native publisher bundle uses tokenizer/tokenizer.json; its ONNX bundle is flat.
         // Only these two fixed layouts are accepted, with no traversal from artifact metadata.
@@ -206,10 +223,24 @@ impl JuliaEncoder {
         Self::from_tokenizer_json(&json, policy)
     }
 
+    #[tracing::instrument(level = "debug", name = "julia_tokenizer_parse", skip_all)]
     pub fn from_tokenizer_json(json: &str, policy: EncodingPolicy) -> eyre::Result<Self> {
         policy.validate()?;
-        let mut tokenizer = Tokenizer::from_bytes(json.as_bytes())
-            .map_err(|error| eyre::eyre!("Invalid Julia tokenizer: {error}"))?;
+        // The published modern BPE bundle streams directly into upstream's builder, avoiding
+        // ModelWrapper's JSON value and BPE's untagged merge-table intermediate/reparse.
+        // Other upstream model types retain the established generic parsing behavior.
+        let mut tokenizer = match BpeTokenizer::from_bytes(json.as_bytes()) {
+            Ok(tokenizer) => {
+                tracing::debug!(generic_fallback = false, "Julia tokenizer parsed");
+                tokenizer.into()
+            }
+            Err(_) => {
+                let tokenizer = Tokenizer::from_bytes(json.as_bytes())
+                    .map_err(|error| eyre::eyre!("Invalid Julia tokenizer: {error}"))?;
+                tracing::debug!(generic_fallback = true, "Julia tokenizer parsed");
+                tokenizer
+            }
+        };
         tokenizer
             .with_truncation(None)
             .map_err(|error| eyre::eyre!("Tokenizer truncation: {error}"))?;
@@ -231,7 +262,7 @@ impl JuliaEncoder {
             .map(|token| token.content)
             .collect();
         Ok(Self {
-            tokenizer,
+            tokenizer: Arc::new(tokenizer),
             policy,
             special_literals,
         })
@@ -402,6 +433,26 @@ fn invalid(message: impl Into<String>) -> FiniteChoiceError {
 mod tests {
     use super::*;
 
+    const BPE_JSON: &str = r#"{
+        "version":"1.0", "truncation":null, "padding":null,
+        "added_tokens":[{"id":4,"content":"<mask>","single_word":false,
+            "lstrip":false,"rstrip":false,"normalized":false,"special":true}],
+        "normalizer":{"type":"Replace","pattern":{"String":" "},"content":"▁"},
+        "pre_tokenizer":{"type":"Metaspace","replacement":"▁",
+            "prepend_scheme":"always","split":true},
+        "post_processor":null,
+        "decoder":{"type":"Metaspace","replacement":"▁",
+            "prepend_scheme":"always","split":true},
+        "model":{"type":"BPE","dropout":null,"unk_token":"<unk>",
+            "continuing_subword_prefix":null,"end_of_word_suffix":null,
+            "fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+            "vocab":{"<pad>":0,"<eos>":1,"<bos>":2,"<unk>":3,"<mask>":4,
+                "▁":5,"a":6,"b":7,"ab":8,"▁ab":9,"ba":10,"▁ba":11,
+                "c":12,"h":13,"o":14,"i":15,"e":16,"q":17,"u":18,
+                "s":19,"t":20,"n":21,":":22},
+            "merges":[["a","b"],["▁","ab"],["b","a"],["▁","ba"]]}
+    }"#;
+
     fn encoder() -> JuliaEncoder {
         let json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{"id":4,"content":"<mask>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],"normalizer":null,"pre_tokenizer":{"type":"WhitespaceSplit"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<pad>":0,"<eos>":1,"<bos>":2,"<unk>":3,"<mask>":4,"choice":5,"question:":6,"First?":7,"one":8,"two":9,"state":10},"unk_token":"<unk>"}}"#;
         JuliaEncoder::from_tokenizer_json(json, EncodingPolicy::default()).unwrap()
@@ -421,6 +472,165 @@ mod tests {
     }
 
     #[test]
+    fn typed_bpe_matches_generic_normalization_pretokenization_and_merges() {
+        let typed: Tokenizer = BpeTokenizer::from_bytes(BPE_JSON.as_bytes())
+            .unwrap()
+            .into();
+        let generic = Tokenizer::from_bytes(BPE_JSON.as_bytes()).unwrap();
+        for text in ["ab ab", " ba", "choice question: ab", "▁ab", "ab\nば"] {
+            assert_eq!(
+                typed.encode(text, false).unwrap(),
+                generic.encode(text, false).unwrap(),
+                "Tokenizer behavior differs for {text:?}"
+            );
+        }
+        let merged = typed.encode("ab ab", false).unwrap();
+        assert_eq!(merged.get_ids(), &[9, 9]);
+        assert_eq!(typed.decode(merged.get_ids(), true).unwrap(), "ab ab");
+        assert_eq!(typed.encode(" ba", false).unwrap().get_ids(), &[11]);
+    }
+
+    #[test]
+    fn typed_bpe_preserves_julia_encoding_and_special_rejection() {
+        let typed = JuliaEncoder::from_tokenizer_json(BPE_JSON, EncodingPolicy::default()).unwrap();
+        let generic_tokenizer = Tokenizer::from_bytes(BPE_JSON.as_bytes()).unwrap();
+        let generic = JuliaEncoder {
+            special_literals: generic_tokenizer
+                .get_added_tokens_decoder()
+                .into_values()
+                .filter(|token| token.special && !token.content.is_empty())
+                .map(|token| token.content)
+                .collect(),
+            tokenizer: Arc::new(generic_tokenizer),
+            policy: EncodingPolicy::default(),
+        };
+        let options = [
+            JuliaTextOption {
+                id: "a".into(),
+                text: "ab".into(),
+            },
+            JuliaTextOption {
+                id: "b".into(),
+                text: "ba".into(),
+            },
+        ];
+        assert_eq!(
+            typed
+                .encode_parts("ab ab", "ab", JuliaQuestionType::Choice, &options)
+                .unwrap(),
+            generic
+                .encode_parts("ab ab", "ab", JuliaQuestionType::Choice, &options)
+                .unwrap(),
+        );
+        for encoder in [&typed, &generic] {
+            assert!(
+                encoder
+                    .encode_parts("ab <mask>", "ab", JuliaQuestionType::Choice, &options)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_bpe_preserves_all_builder_flags_and_nullable_defaults() {
+        let empty_merges = BPE_JSON.replace(
+            "[[\"a\",\"b\"],[\"▁\",\"ab\"],[\"b\",\"a\"],[\"▁\",\"ba\"]]",
+            "[]",
+        );
+        let cases = [
+            BPE_JSON.replace("\"dropout\":null", "\"dropout\":0.25"),
+            BPE_JSON.replace("\"unk_token\":\"<unk>\"", "\"unk_token\":null"),
+            empty_merges.replace(
+                "\"continuing_subword_prefix\":null",
+                "\"continuing_subword_prefix\":\"##\"",
+            ),
+            empty_merges.replace(
+                "\"end_of_word_suffix\":null",
+                "\"end_of_word_suffix\":\"$\"",
+            ),
+            BPE_JSON.replace("\"fuse_unk\":false", "\"fuse_unk\":true"),
+            BPE_JSON.replace("\"byte_fallback\":false", "\"byte_fallback\":true"),
+            BPE_JSON.replace("\"ignore_merges\":false", "\"ignore_merges\":true"),
+            BPE_JSON
+                .replace("\"fuse_unk\":false", "\"fuse_unk\":null")
+                .replace("\"byte_fallback\":false", "\"byte_fallback\":null")
+                .replace("\"ignore_merges\":false", "\"ignore_merges\":null"),
+        ];
+        for json in cases {
+            let streamed: Tokenizer = BpeTokenizer::from_bytes(json.as_bytes()).unwrap().into();
+            let generic = Tokenizer::from_bytes(json.as_bytes()).unwrap();
+            assert_eq!(streamed.get_model(), generic.get_model());
+        }
+    }
+
+    #[test]
+    fn legacy_bpe_merges_retain_generic_fallback_and_exact_julia_encoding() {
+        let legacy = BPE_JSON.replace(
+            "[[\"a\",\"b\"],[\"▁\",\"ab\"],[\"b\",\"a\"],[\"▁\",\"ba\"]]",
+            "[\"a b\",\"▁ ab\",\"b a\",\"▁ ba\"]",
+        );
+        assert!(BpeTokenizer::from_bytes(legacy.as_bytes()).is_err());
+        let legacy_encoder =
+            JuliaEncoder::from_tokenizer_json(&legacy, EncodingPolicy::default()).unwrap();
+        let modern_encoder =
+            JuliaEncoder::from_tokenizer_json(BPE_JSON, EncodingPolicy::default()).unwrap();
+        let options = [
+            JuliaTextOption {
+                id: "a".into(),
+                text: "ab".into(),
+            },
+            JuliaTextOption {
+                id: "b".into(),
+                text: "ba".into(),
+            },
+        ];
+        assert_eq!(
+            legacy_encoder
+                .encode_parts("ab ba ab", "ab", JuliaQuestionType::Choice, &options)
+                .unwrap(),
+            modern_encoder
+                .encode_parts("ab ba ab", "ab", JuliaQuestionType::Choice, &options)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn streaming_bpe_rejects_non_bpe_models_and_invalid_dropout() {
+        let wrong_type = BPE_JSON.replace("\"type\":\"BPE\"", "\"type\":\"WordPiece\"");
+        assert!(BpeTokenizer::from_bytes(wrong_type.as_bytes()).is_err());
+        for dropout in [-0.25, 1.25] {
+            let malformed = BPE_JSON.replace("\"dropout\":null", &format!("\"dropout\":{dropout}"));
+            assert!(BpeTokenizer::from_bytes(malformed.as_bytes()).is_err());
+            assert!(Tokenizer::from_bytes(malformed.as_bytes()).is_err());
+            assert!(
+                JuliaEncoder::from_tokenizer_json(&malformed, EncodingPolicy::default()).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_bpe_rejects_malformed_tuple_and_merge_output_without_vocabulary_entry() {
+        for malformed in [
+            BPE_JSON.replace("[\"a\",\"b\"]", "[\"a\",\"b\",\"ab\"]"),
+            BPE_JSON.replace("\"ab\":8,", ""),
+        ] {
+            assert!(BpeTokenizer::from_bytes(malformed.as_bytes()).is_err());
+            assert!(Tokenizer::from_bytes(malformed.as_bytes()).is_err());
+            assert!(
+                JuliaEncoder::from_tokenizer_json(&malformed, EncodingPolicy::default()).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_bpe_is_not_accepted_by_generic_fallback() {
+        let malformed = BPE_JSON.replace("[\"a\",\"b\"]", "[\"missing\",\"b\"]");
+        assert!(BpeTokenizer::from_bytes(malformed.as_bytes()).is_err());
+        assert!(Tokenizer::from_bytes(malformed.as_bytes()).is_err());
+        assert!(JuliaEncoder::from_tokenizer_json(&malformed, EncodingPolicy::default()).is_err());
+    }
+
+    #[test]
     fn preserves_sequence_markers_order_and_eight_token_padding() {
         let actual = encoder()
             .encode_parts("state", "First?", JuliaQuestionType::Choice, &options())
@@ -433,6 +643,46 @@ mod tests {
             actual.attention_mask,
             [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn clone_shares_tokenizer_and_preserves_complete_encoding() {
+        let encoder = encoder();
+        let cloned = encoder.clone();
+        assert!(Arc::ptr_eq(&encoder.tokenizer, &cloned.tokenizer));
+        assert_eq!(encoder.policy(), cloned.policy());
+        let encode = |encoder: &JuliaEncoder| {
+            encoder
+                .encode_parts("state", "First?", JuliaQuestionType::Choice, &options())
+                .unwrap()
+        };
+        assert_eq!(encode(&encoder), encode(&cloned));
+        assert!(
+            cloned
+                .encode_parts(
+                    "state <mask>",
+                    "First?",
+                    JuliaQuestionType::Choice,
+                    &options()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cloned_policy_is_independent_and_survives_original_drop() {
+        let encoder = encoder();
+        let original_policy = encoder.policy().clone();
+        let mut cloned = encoder.clone();
+        cloned.policy.max_tokens = 64;
+        cloned.policy.head_tokens = 32;
+        assert_eq!(encoder.policy(), &original_policy);
+        drop(encoder);
+        assert_eq!(cloned.policy().max_tokens, 64);
+        let actual = cloned
+            .encode_parts("state", "First?", JuliaQuestionType::Choice, &options())
+            .unwrap();
+        assert_eq!(actual.raw_input_ids, [2, 5, 6, 7, 1, 4, 8, 4, 9, 1, 10, 1]);
     }
 
     #[test]

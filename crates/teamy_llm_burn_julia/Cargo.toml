@@ -9,12 +9,18 @@ publish = false
 
 [dependencies]
 burn.workspace = true
+burn-cubecl = { version = "=0.21.0", default-features = false }
+cubek = { version = "=0.2.0", default-features = false, features = ["matmul", "stdlib"] }
+cubecl-cuda = { version = "=0.10.0", default-features = false, features = ["teamy-cubin-cache"] }
+cudarc = { version = "=0.19.8", default-features = false }
 eyre.workspace = true
 facet.workspace = true
 facet-json.workspace = true
 half.workspace = true
+libloading.workspace = true
 memmap2.workspace = true
 safetensors.workspace = true
+sha2.workspace = true
 teamy-cancellation.workspace = true
 teamy_llm_burn_qwen35.workspace = true
 teamy_llm_core.workspace = true

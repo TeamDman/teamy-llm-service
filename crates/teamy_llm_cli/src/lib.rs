@@ -73,32 +73,36 @@ pub fn main() -> Result<()> {
         cancellation.clone(),
     )?;
     let requested_output = cli.global_args.output_format;
+    // Finite-choice evaluation and its bounded stdin reader are synchronous.
+    // Avoid starting and joining a Tokio worker pool for this single request.
+    if let Command::Decide(args) = cli.command {
+        cli::decide::run(args, requested_output, cancellation.clone())?;
+        cancellation.bail_if_cancelled()?;
+        interactive::terminal_output::check_human_output()?;
+        return Ok(());
+    }
     runtime()?.block_on(async move {
         cancellation.bail_if_cancelled()?;
-        if let Command::Decide(args) = cli.command {
-            cli::decide::run(args, requested_output, cancellation.clone())?;
-        } else {
-            let service = TeamyLlmService::from_default_dirs()?;
-            match cli.command {
-                Command::Health(args) => args.invoke(&service, requested_output)?,
-                Command::Serve(args) => args.invoke(service, cancellation.clone()).await?,
-                Command::Model(args) => args.invoke(&service, requested_output).await?,
-                Command::Prompt(args) => {
-                    args.invoke(&service, requested_output, cancellation.clone())
-                        .await?
-                }
-                Command::Interactive(args) => {
-                    interactive::run_interactive(args, service, cancellation.clone()).await?
-                }
-                Command::TopTokens(args) => args.invoke(&service, requested_output)?,
-                Command::TopCompletions(args) => args.invoke(&service, requested_output)?,
-                Command::Rank(args) => args.invoke(&service, requested_output)?,
-                Command::Benchmark(args) => {
-                    args.invoke(&service, requested_output, cancellation.clone())?
-                }
-                Command::Decide(_) => {
-                    unreachable!("decide was dispatched before service construction")
-                }
+        let service = TeamyLlmService::from_default_dirs()?;
+        match cli.command {
+            Command::Health(args) => args.invoke(&service, requested_output)?,
+            Command::Serve(args) => args.invoke(service, cancellation.clone()).await?,
+            Command::Model(args) => args.invoke(&service, requested_output).await?,
+            Command::Prompt(args) => {
+                args.invoke(&service, requested_output, cancellation.clone())
+                    .await?
+            }
+            Command::Interactive(args) => {
+                interactive::run_interactive(args, service, cancellation.clone()).await?
+            }
+            Command::TopTokens(args) => args.invoke(&service, requested_output)?,
+            Command::TopCompletions(args) => args.invoke(&service, requested_output)?,
+            Command::Rank(args) => args.invoke(&service, requested_output)?,
+            Command::Benchmark(args) => {
+                args.invoke(&service, requested_output, cancellation.clone())?
+            }
+            Command::Decide(_) => {
+                unreachable!("decide was dispatched before service construction")
             }
         }
         cancellation.bail_if_cancelled()?;

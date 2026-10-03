@@ -253,6 +253,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use teamy_llm_burn_qwen35::paths::{AppHome, CacheHome};
 
+    // These fixtures exercise the same tracing callsites with and without a scoped
+    // subscriber. Keep callsite registration/interest changes out of each other's runs.
+    static OBSERVER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[derive(Clone)]
     struct RecordingSink(Arc<Mutex<Vec<u8>>>);
 
@@ -269,6 +273,7 @@ mod tests {
 
     #[test]
     fn first_visible_diagnostic_precedes_streamed_text_in_a_shared_terminal_sink() {
+        let _guard = OBSERVER_TEST_LOCK.lock().unwrap();
         let captured = Arc::new(Mutex::new(Vec::new()));
         let mut output = RecordingSink(captured.clone());
         let diagnostics = output.clone();
@@ -341,6 +346,7 @@ mod tests {
 
     #[test]
     fn empty_tokens_do_not_count_as_visible_and_json_does_not_stream() {
+        let _guard = OBSERVER_TEST_LOCK.lock().unwrap();
         let mut bytes = Vec::new();
         let mut observer = PromptObserver {
             writer: &mut bytes,
@@ -370,6 +376,7 @@ mod tests {
 
     #[test]
     fn streamed_unicode_is_preserved_and_writer_failures_are_errors() {
+        let _guard = OBSERVER_TEST_LOCK.lock().unwrap();
         let mut bytes = Vec::new();
         let mut observer = PromptObserver {
             writer: &mut bytes,

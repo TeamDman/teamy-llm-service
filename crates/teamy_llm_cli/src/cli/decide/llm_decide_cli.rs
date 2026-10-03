@@ -204,9 +204,15 @@ enum Provider {
     Onnx(Box<JuliaOnnxProvider>),
 }
 impl Provider {
-    fn infer_encoded(&mut self, encoding: &EncodedJuliaRequest) -> Result<Vec<f64>> {
+    fn infer_encoded(
+        &mut self,
+        encoding: &EncodedJuliaRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<f64>> {
         match self {
-            Self::Native(provider) => provider.infer_encoded(encoding),
+            Self::Native(provider) => {
+                provider.infer_encoded_with_cancellation(encoding, cancellation)
+            }
             Self::Onnx(provider) => provider.infer_encoded(encoding),
         }
     }
@@ -312,6 +318,38 @@ impl DecisionEngine {
                 self.options.provider,
             )?);
         }
+        let mut initial_load_ms = None;
+        if self.resident.is_none()
+            && self.encoder.is_none()
+            && self.options.provider == DecisionProvider::Native
+        {
+            let started = Instant::now();
+            let _span = tracing::info_span!(
+                "julia_load",
+                provider = "native",
+                device = self.options.device.as_str()
+            )
+            .entered();
+            // Capability/policy checks precede startup. Tokenizer parsing overlaps
+            // bounded numerical loading; encoding must succeed before inference.
+            let provider = NativeJuliaProvider::load(
+                self.model_dir.as_deref().expect("resolved Julia directory"),
+                if self.options.device == DecisionDevice::Cuda {
+                    NativeDevice::Cuda
+                } else {
+                    NativeDevice::Cpu
+                },
+                policy.clone(),
+                cancellation.clone(),
+            )?;
+            self.encoder = Some((policy.clone(), provider.encoder().clone()));
+            self.resident = Some(ResidentDecision {
+                native_metadata: Some(provider.metadata().clone()),
+                provider: Provider::Native(Box::new(provider)),
+                audit: None,
+            });
+            initial_load_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+        }
         if self
             .encoder
             .as_ref()
@@ -333,7 +371,9 @@ impl DecisionEngine {
             .encode(&validated)?;
         cancellation.bail_if_cancelled()?;
         let load_started = Instant::now();
-        let load_ms = if self.resident.is_none() {
+        let load_ms = if let Some(initial) = initial_load_ms {
+            initial
+        } else if self.resident.is_none() {
             self.resident = Some(self.load_provider(policy.clone(), cancellation.clone())?);
             load_started.elapsed().as_secs_f64() * 1000.0
         } else {
@@ -357,7 +397,7 @@ impl DecisionEngine {
                 .as_mut()
                 .expect("provider loaded")
                 .provider
-                .infer_encoded(&encoded);
+                .infer_encoded(&encoded, &cancellation);
             let logits = match logits {
                 Ok(values) => values,
                 Err(error) => {
@@ -427,10 +467,10 @@ impl DecisionEngine {
             } else {
                 NativeDevice::Cpu
             };
-            let provider = NativeJuliaProvider::load(
+            let provider = NativeJuliaProvider::load_with_encoder(
                 self.model_dir.as_deref().expect("resolved Julia directory"),
                 device,
-                policy,
+                self.encoder.as_ref().expect("encoder loaded").1.clone(),
                 cancellation,
             )?;
             let metadata = provider.metadata().clone();

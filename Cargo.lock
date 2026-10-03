@@ -1401,8 +1401,6 @@ dependencies = [
 [[package]]
 name = "cubecl-common"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc956c2dcc993f16f748d03bfdbd900f75cab4d469f4e5d8924f8ee128e861ad"
 dependencies = [
  "backtrace",
  "bytemuck",
@@ -1510,8 +1508,6 @@ dependencies = [
 [[package]]
 name = "cubecl-cuda"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6b0a69ff45688d322ad8e92c8bf645167b9ca490fa8fa087fc6adac8c5e46be"
 dependencies = [
  "bytemuck",
  "cubecl-common",
@@ -5989,12 +5985,18 @@ name = "teamy_llm_burn_julia"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "burn-cubecl",
+ "cubecl-cuda",
+ "cubek",
+ "cudarc",
  "eyre",
  "facet",
  "facet-json",
  "half",
+ "libloading 0.9.0",
  "memmap2",
  "safetensors 0.7.0",
+ "sha2 0.10.9",
  "teamy-cancellation",
  "teamy_llm_burn_qwen35",
  "teamy_llm_core",
@@ -6072,8 +6074,10 @@ dependencies = [
  "eyre",
  "facet",
  "facet-json",
+ "serde",
  "teamy_llm_core",
  "tokenizers",
+ "tracing",
 ]
 
 [[package]]

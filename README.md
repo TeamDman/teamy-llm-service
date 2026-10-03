@@ -78,6 +78,25 @@ fails strict CUDA preparation. `--profile-prefix` records placement and returns 
 trace path in the JSON result. `--repeat` reuses the loaded provider and records each inference
 duration. Machine results remain on stdout; logs remain on stderr, including with JSON output.
 
+Native CUDA uses explicit FP32 tiled matmul and retains the vocabulary in an immutable
+host mapping, uploading only the ordered embedding rows needed by a request. Tokenizer
+parsing and checkpoint validation overlap CUDA setup; the provider is published only
+after its workers join successfully. Capability and policy checks precede startup;
+encoding must succeed before inference, although numerical preparation can start sooner.
+
+The native provider automatically persists compiled CUBIN kernels beneath its resolved
+cache home. Compatibility includes the executable, CUDA toolkit contents and device
+architecture; an exclusive lease protects writes. Missing or unusable entries compile
+again. The first request for a new executable can therefore take longer than subsequent
+fresh processes, even though each process loads its own model. The cache is trusted local
+executable material; its checksum detects accidental corruption, not hostile replacement.
+
+Use `--debug --log-file 'julia-timing.ndjson'` for phase diagnostics. Measure complete
+process exit and output EOF separately when assessing latency, and distinguish an empty
+kernel cache, populated kernel cache and GPU-resident provider. See the purpose-based
+[performance guide](https://teamdman.github.io/teamy-docs/performance-analysis.html#diagnose-julia-with-ndjson-before-timing)
+for tracing boundaries and the distinction from Tracy capture through `teamy-profiler`.
+
 ## Quantized OrcaRouter prompts
 
 The new `qwen3.8-27b-uncensored-q4-k-m` model uses Makepad's native CUDA GGUF executor, with

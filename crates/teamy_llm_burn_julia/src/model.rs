@@ -3,15 +3,17 @@
 //! Port reference: Julia a85b127 and Transformers 5.0.0 ModernBERT. Weights are
 //! checked by name/rank/shape; no TorchScript, LibTorch or Python executes here.
 
-use std::{collections::BTreeMap, fs::File, path::Path};
+use std::{collections::BTreeMap, fs::File, ops::Range, path::Path, sync::Arc};
 
-use burn::tensor::{Bool, Int, Tensor, TensorData, activation, backend::Backend, module};
+use burn::tensor::{Bool, Int, Tensor, TensorData, activation, backend::Backend};
 use eyre::{WrapErr, ensure};
 use facet::Facet;
-use memmap2::MmapOptions;
+use memmap2::{Mmap, MmapOptions};
 use safetensors::{Dtype, SafeTensors};
 use teamy_cancellation::CancellationToken;
 use teamy_llm_julia_common::EncodedJuliaRequest;
+
+use crate::matmul::JuliaBackend;
 
 #[derive(Facet)]
 struct RopeConfig {
@@ -54,11 +56,20 @@ struct Linear<B: Backend> {
 #[derive(Clone, Copy)]
 pub(crate) enum MatmulMode {
     Burn,
+    /// Whole-matrix Register-tile matmul, retaining FP32 CUDA operands.
+    Fp32Tiled,
     /// Elementwise multiply/reduction avoids accelerated TF32 matrix multiplication.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retain the FP32 reduction oracle for qualification tests."
+        )
+    )]
     Fp32Reference,
 }
 
-impl<B: Backend> Linear<B> {
+impl<B: JuliaBackend> Linear<B> {
     fn forward(&self, input: Tensor<B, 3>, mode: MatmulMode) -> Tensor<B, 3> {
         let output = matmul3(
             input,
@@ -111,10 +122,150 @@ struct HeadLayer<B: Backend> {
     linear2: Linear<B>,
 }
 
+/// Keep the full validated vocabulary on the host; each request uploads only
+/// its ordered FP32 rows. The map owns its storage, so no borrowed safetensors
+/// views escape loading and no unaligned typed pointer is constructed.
+struct MappedEmbeddings {
+    mapped: Arc<Mmap>,
+    bytes: Range<usize>,
+    rows: usize,
+    width: usize,
+}
+
+impl MappedEmbeddings {
+    fn from_checkpoint(
+        mapped: Arc<Mmap>,
+        expected: [usize; 2],
+        cancellation: &CancellationToken,
+    ) -> eyre::Result<Self> {
+        cancellation.bail_if_cancelled()?;
+        let (header_bytes, metadata) =
+            SafeTensors::read_metadata(&mapped).wrap_err("Read Julia embedding tensor index")?;
+        let name = "encoder.embeddings.tok_embeddings.weight";
+        let info = metadata
+            .info(name)
+            .ok_or_else(|| eyre::eyre!("Missing Julia tensor {name}"))?;
+        ensure!(
+            info.shape == expected,
+            "Tensor {name} has shape {:?}; expected {expected:?}",
+            info.shape
+        );
+        ensure!(
+            info.dtype == Dtype::F32,
+            "Tensor {name} must contain float32 values"
+        );
+        // Safetensors stores an eight-byte header length, then its JSON header,
+        // then tensor payloads. Offsets in TensorInfo are relative to the payload.
+        let payload = header_bytes
+            .checked_add(8)
+            .ok_or_else(|| eyre::eyre!("Julia embedding header offset overflow"))?;
+        let start = payload
+            .checked_add(info.data_offsets.0)
+            .ok_or_else(|| eyre::eyre!("Julia embedding start offset overflow"))?;
+        let end = payload
+            .checked_add(info.data_offsets.1)
+            .ok_or_else(|| eyre::eyre!("Julia embedding end offset overflow"))?;
+        Self::from_range(mapped, start..end, expected, cancellation)
+    }
+
+    fn from_range(
+        mapped: Arc<Mmap>,
+        bytes: Range<usize>,
+        [rows, width]: [usize; 2],
+        cancellation: &CancellationToken,
+    ) -> eyre::Result<Self> {
+        cancellation.bail_if_cancelled()?;
+        ensure!(
+            rows > 0 && width > 0,
+            "Julia embedding shape must be positive"
+        );
+        let expected_bytes = rows
+            .checked_mul(width)
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or_else(|| eyre::eyre!("Julia embedding shape overflows its byte bound"))?;
+        let data = mapped
+            .get(bytes.clone())
+            .ok_or_else(|| eyre::eyre!("Julia embedding range is outside the checkpoint"))?;
+        ensure!(
+            data.len() == expected_bytes && data.len().is_multiple_of(4),
+            "Julia embedding payload must contain exactly its declared FP32 values"
+        );
+        let _span = tracing::debug_span!("julia_embedding_validate", bytes = data.len()).entered();
+        // Check every row, including rows not used by the first request. Chunk
+        // boundaries retain prompt-independent validation and cancellation.
+        for chunk in data.chunks(1024 * 1024) {
+            cancellation.bail_if_cancelled()?;
+            ensure!(
+                crate::finite_scan::all_finite_f32_le(chunk),
+                "Julia embedding tensor contains nonfinite values"
+            );
+        }
+        cancellation.bail_if_cancelled()?;
+        Ok(Self {
+            mapped,
+            bytes,
+            rows,
+            width,
+        })
+    }
+
+    fn gather(
+        &self,
+        input_ids: &[i64],
+        cancellation: &CancellationToken,
+    ) -> eyre::Result<Vec<f32>> {
+        cancellation.bail_if_cancelled()?;
+        let elements = input_ids
+            .len()
+            .checked_mul(self.width)
+            .ok_or_else(|| eyre::eyre!("Julia embedding request size overflow"))?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(elements)
+            .wrap_err("Allocate Julia input embeddings")?;
+        for &token in input_ids {
+            cancellation.bail_if_cancelled()?;
+            let row = usize::try_from(token).wrap_err("Julia token index must be nonnegative")?;
+            ensure!(
+                row < self.rows,
+                "Julia token index is outside the embedding vocabulary"
+            );
+            let relative = row
+                .checked_mul(self.width)
+                .and_then(|offset| offset.checked_mul(4))
+                .ok_or_else(|| eyre::eyre!("Julia embedding row offset overflow"))?;
+            let start = self
+                .bytes
+                .start
+                .checked_add(relative)
+                .ok_or_else(|| eyre::eyre!("Julia embedding row start overflow"))?;
+            let end = self
+                .width
+                .checked_mul(4)
+                .and_then(|row_bytes| start.checked_add(row_bytes))
+                .ok_or_else(|| eyre::eyre!("Julia embedding row end overflow"))?;
+            ensure!(
+                end <= self.bytes.end,
+                "Julia embedding row exceeds its validated range"
+            );
+            let data = self
+                .mapped
+                .get(start..end)
+                .ok_or_else(|| eyre::eyre!("Julia embedding row is outside the checkpoint"))?;
+            values.extend(
+                data.chunks_exact(4)
+                    .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk"))),
+            );
+        }
+        cancellation.bail_if_cancelled()?;
+        Ok(values)
+    }
+}
+
 pub(crate) struct JuliaModel<B: Backend> {
     device: B::Device,
     config: EncoderConfig,
-    embeddings: Tensor<B, 2>,
+    embeddings: MappedEmbeddings,
     embedding_norm: Norm<B>,
     layers: Vec<EncoderLayer<B>>,
     final_norm: Norm<B>,
@@ -124,15 +275,25 @@ pub(crate) struct JuliaModel<B: Backend> {
     scorer_hidden: Linear<B>,
     scorer_output: Linear<B>,
     matmul_mode: MatmulMode,
+    // The retained read handle denies writes/deletion on Windows for the entire
+    // mapped-table lifetime. Fields above (including the map) drop before this.
+    _weights_file: File,
 }
 
-impl<B: Backend> JuliaModel<B> {
-    pub(crate) fn load(
-        model_dir: &Path,
-        device: B::Device,
-        cancellation: &CancellationToken,
-        matmul_mode: MatmulMode,
-    ) -> eyre::Result<Self> {
+/// Backend-independent, validated host data. File ownership prevents mutation
+/// throughout preparation and transfers with the mapping into the final model.
+pub(crate) struct PreparedCheckpoint {
+    config: EncoderConfig,
+    julia: JuliaConfig,
+    mapped: Arc<Mmap>,
+    embeddings: MappedEmbeddings,
+    file: File,
+}
+
+impl PreparedCheckpoint {
+    #[tracing::instrument(level = "debug", name = "julia_checkpoint_prepare", skip_all)]
+    pub(crate) fn load(model_dir: &Path, cancellation: &CancellationToken) -> eyre::Result<Self> {
+        cancellation.bail_if_cancelled()?;
         let config: EncoderConfig = facet_json::from_str(&std::fs::read_to_string(
             model_dir.join("encoder/config.json"),
         )?)?;
@@ -177,15 +338,76 @@ impl<B: Backend> JuliaModel<B> {
             );
         }
         cancellation.bail_if_cancelled()?;
-        let file =
-            File::open(model_dir.join("model.safetensors")).wrap_err("Open Julia safetensors")?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_SHARE_READ permits other readers while excluding writers and
+            // deletion/replacement of the checkpoint while its map is retained.
+            options.share_mode(1);
+        }
+        let file = options
+            .open(model_dir.join("model.safetensors"))
+            .wrap_err("Open immutable Julia safetensors")?;
         ensure!(
             file.metadata()?.len() <= 1_000_000_000,
             "Julia checkpoint exceeds the supported file bound"
         );
-        // SAFETY: the selected immutable acquisition file is read-only. The map remains alive
-        // until all views have been copied into backend-owned tensors, and never escapes loading.
-        let mapped = unsafe { MmapOptions::new().map(&file) }.wrap_err("Map Julia safetensors")?;
+        // SAFETY: the selected acquisition file is immutable while the model is
+        // resident. Windows enforces this through the retained read-only handle;
+        // other platforms retain the existing immutable-acquisition requirement.
+        // Arc owns the mapping; only checked byte slices are retained and decoded.
+        let mapped =
+            Arc::new(unsafe { MmapOptions::new().map(&file) }.wrap_err("Map Julia safetensors")?);
+        // Validate the complete index now. Rebuild its small borrowed view on
+        // the numerical thread, avoiding a self-referential checkpoint object.
+        let _ = SafeTensors::deserialize(&mapped).wrap_err("Read Julia tensor index")?;
+        let width = config.hidden_size;
+        let embeddings = MappedEmbeddings::from_checkpoint(
+            Arc::clone(&mapped),
+            [config.vocab_size, width],
+            cancellation,
+        )?;
+        Ok(Self {
+            config,
+            julia,
+            mapped,
+            embeddings,
+            file,
+        })
+    }
+}
+
+impl<B: JuliaBackend> JuliaModel<B> {
+    pub(crate) fn load(
+        model_dir: &Path,
+        device: B::Device,
+        cancellation: &CancellationToken,
+        matmul_mode: MatmulMode,
+    ) -> eyre::Result<Self> {
+        Self::load_prepared(
+            PreparedCheckpoint::load(model_dir, cancellation)?,
+            device,
+            cancellation,
+            matmul_mode,
+        )
+    }
+
+    pub(crate) fn load_prepared(
+        checkpoint: PreparedCheckpoint,
+        device: B::Device,
+        cancellation: &CancellationToken,
+        matmul_mode: MatmulMode,
+    ) -> eyre::Result<Self> {
+        cancellation.bail_if_cancelled()?;
+        let PreparedCheckpoint {
+            config,
+            julia,
+            mapped,
+            embeddings,
+            file,
+        } = checkpoint;
         let tensors = SafeTensors::deserialize(&mapped).wrap_err("Read Julia tensor index")?;
         let loader = Loader {
             tensors: &tensors,
@@ -193,10 +415,6 @@ impl<B: Backend> JuliaModel<B> {
             cancellation,
         };
         let width = config.hidden_size;
-        let embeddings = loader.tensor(
-            "encoder.embeddings.tok_embeddings.weight",
-            [config.vocab_size, width],
-        )?;
         let embedding_norm =
             loader.norm("encoder.embeddings.norm", width, false, config.norm_eps)?;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -292,6 +510,7 @@ impl<B: Backend> JuliaModel<B> {
             scorer_hidden,
             scorer_output,
             matmul_mode,
+            _weights_file: file,
         })
     }
 
@@ -309,13 +528,21 @@ impl<B: Backend> JuliaModel<B> {
         let width = self.config.hidden_size;
         let heads = self.config.num_attention_heads;
         let head_width = width / heads;
-        let token_ids = Tensor::<B, 2, Int>::from_data(
-            TensorData::new(encoded.input_ids.clone(), [1, length]),
+        let embedding_span = tracing::debug_span!(
+            "julia_embedding_gather",
+            tokens = length,
+            upload_bytes = length * width * 4
+        )
+        .entered();
+        let input_embeddings = Tensor::<B, 3>::from_data(
+            TensorData::new(
+                self.embeddings.gather(&encoded.input_ids, cancellation)?,
+                [1, length, width],
+            ),
             &self.device,
         );
-        let mut hidden = self
-            .embedding_norm
-            .forward(module::embedding(self.embeddings.clone(), token_ids));
+        drop(embedding_span);
+        let mut hidden = self.embedding_norm.forward(input_embeddings);
         let global_mask = attention_mask::<B>(&encoded.attention_mask, None, &self.device);
         let local_mask = attention_mask::<B>(
             &encoded.attention_mask,
@@ -429,15 +656,15 @@ impl<B: Backend> Loader<'_, B> {
             view.dtype() == Dtype::F32,
             "Tensor {name} must contain float32 values"
         );
+        ensure!(
+            crate::finite_scan::all_finite_f32_le(view.data()),
+            "Tensor {name} contains nonfinite values"
+        );
         let values = view
             .data()
             .chunks_exact(4)
             .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
             .collect::<Vec<_>>();
-        ensure!(
-            values.iter().all(|value| value.is_finite()),
-            "Tensor {name} contains nonfinite values"
-        );
         Ok(Tensor::from_data(
             TensorData::new(values, expected),
             self.device,
@@ -474,7 +701,7 @@ impl<B: Backend> Loader<'_, B> {
     }
 }
 
-fn attention<B: Backend>(
+fn attention<B: JuliaBackend>(
     qkv: Tensor<B, 3>,
     heads: usize,
     mask: Tensor<B, 4, Bool>,
@@ -504,7 +731,11 @@ fn attention<B: Backend>(
         .reshape([batch, length, width])
 }
 
-fn matmul3<B: Backend>(lhs: Tensor<B, 3>, rhs: Tensor<B, 3>, mode: MatmulMode) -> Tensor<B, 3> {
+fn matmul3<B: JuliaBackend>(
+    lhs: Tensor<B, 3>,
+    rhs: Tensor<B, 3>,
+    mode: MatmulMode,
+) -> Tensor<B, 3> {
     let [batch_l, rows, inner] = lhs.dims();
     let [batch_r, _, columns] = rhs.dims();
     matmul4(
@@ -518,9 +749,16 @@ fn matmul3<B: Backend>(lhs: Tensor<B, 3>, rhs: Tensor<B, 3>, mode: MatmulMode) -
 /// Correctness configuration using ordinary F32 multiplication and reduction kernels.
 /// All matrix dimensions are chunked: the largest multiplication temporary contains
 /// batch * heads * 32 * 128 * 32 floats. No accelerated Tensor::matmul runs in this mode.
-fn matmul4<B: Backend>(lhs: Tensor<B, 4>, rhs: Tensor<B, 4>, mode: MatmulMode) -> Tensor<B, 4> {
+fn matmul4<B: JuliaBackend>(
+    lhs: Tensor<B, 4>,
+    rhs: Tensor<B, 4>,
+    mode: MatmulMode,
+) -> Tensor<B, 4> {
     if matches!(mode, MatmulMode::Burn) {
         return lhs.matmul(rhs);
+    }
+    if matches!(mode, MatmulMode::Fp32Tiled) {
+        return B::fp32_matmul(lhs, rhs);
     }
     let [batch_l, heads_l, rows, inner] = lhs.dims();
     let [batch_r, heads_r, inner_r, columns] = rhs.dims();
@@ -625,6 +863,137 @@ mod tests {
     use burn::backend::NdArray;
     type Cpu = NdArray<f32>;
 
+    fn read_only_fixture(bytes: &[u8]) -> Arc<Mmap> {
+        let mut mapped = memmap2::MmapMut::map_anon(bytes.len()).unwrap();
+        mapped.copy_from_slice(bytes);
+        Arc::new(mapped.make_read_only().unwrap())
+    }
+
+    fn embedding_fixture(values: &[f32], shape: [usize; 2]) -> Arc<Mmap> {
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let view =
+            safetensors::tensor::TensorView::new(Dtype::F32, shape.to_vec(), &bytes).unwrap();
+        let checkpoint = safetensors::tensor::serialize(
+            [("encoder.embeddings.tok_embeddings.weight", view)],
+            None,
+        )
+        .unwrap();
+        read_only_fixture(&checkpoint)
+    }
+
+    #[test]
+    fn mapped_embedding_gather_preserves_row_order_duplicates_padding_and_f32_bits() {
+        let cancellation = CancellationToken::new();
+        let embeddings = MappedEmbeddings::from_checkpoint(
+            embedding_fixture(&[-0.0, 1.25, 2.0, -3.5, 4.0, 5.0], [3, 2]),
+            [3, 2],
+            &cancellation,
+        )
+        .unwrap();
+        let actual = embeddings.gather(&[2, 0, 2, 1], &cancellation).unwrap();
+        let expected = [4.0_f32, 5.0, -0.0, 1.25, 4.0, 5.0, 2.0, -3.5];
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        let uploaded =
+            Tensor::<Cpu, 3>::from_data(TensorData::new(actual, [1, 4, 2]), &Default::default());
+        assert_eq!(uploaded.dims(), [1, 4, 2]);
+        assert_eq!(uploaded.into_data().to_vec::<f32>().unwrap(), expected);
+    }
+
+    #[test]
+    fn mapped_embedding_gather_rejects_negative_out_of_vocabulary_and_huge_indices() {
+        let cancellation = CancellationToken::new();
+        let embeddings = MappedEmbeddings::from_checkpoint(
+            embedding_fixture(&[1.0, 2.0, 3.0, 4.0], [2, 2]),
+            [2, 2],
+            &cancellation,
+        )
+        .unwrap();
+        for index in [-1, 2, i64::MAX] {
+            assert!(embeddings.gather(&[index], &cancellation).is_err());
+        }
+    }
+
+    #[test]
+    fn mapped_embedding_load_rejects_nonfinite_values_in_unused_rows() {
+        let cancellation = CancellationToken::new();
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let result = MappedEmbeddings::from_checkpoint(
+                embedding_fixture(&[1.0, 2.0, 3.0, value], [2, 2]),
+                [2, 2],
+                &cancellation,
+            );
+            assert!(result.is_err_and(|error| error.to_string().contains("nonfinite")));
+        }
+    }
+
+    #[test]
+    fn mapped_embedding_load_checks_shape_dtype_payload_and_byte_bounds() {
+        let cancellation = CancellationToken::new();
+        let fixture = embedding_fixture(&[1.0, 2.0, 3.0, 4.0], [2, 2]);
+        assert!(
+            MappedEmbeddings::from_checkpoint(Arc::clone(&fixture), [4, 1], &cancellation).is_err()
+        );
+        let bytes = [0_u8; 8];
+        let integer_view =
+            safetensors::tensor::TensorView::new(Dtype::I32, vec![2, 1], &bytes).unwrap();
+        let integer_checkpoint = safetensors::tensor::serialize(
+            [("encoder.embeddings.tok_embeddings.weight", integer_view)],
+            None,
+        )
+        .unwrap();
+        assert!(
+            MappedEmbeddings::from_checkpoint(
+                read_only_fixture(&integer_checkpoint),
+                [2, 1],
+                &cancellation,
+            )
+            .is_err()
+        );
+        for (range, shape) in [(0..3, [1, 1]), (0..9, [2, 1]), (0..8, [0, 2])] {
+            assert!(
+                MappedEmbeddings::from_range(
+                    read_only_fixture(&bytes),
+                    range,
+                    shape,
+                    &cancellation
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            MappedEmbeddings::from_range(
+                read_only_fixture(&bytes),
+                0..8,
+                [usize::MAX, 2],
+                &cancellation,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mapped_embedding_load_and_gather_respect_cancellation() {
+        let cancellation = CancellationToken::new();
+        let fixture = embedding_fixture(&[1.0, 2.0], [2, 1]);
+        let embeddings =
+            MappedEmbeddings::from_checkpoint(Arc::clone(&fixture), [2, 1], &cancellation).unwrap();
+        cancellation.request_cancel("fixture stop");
+        assert!(MappedEmbeddings::from_checkpoint(fixture, [2, 1], &cancellation).is_err());
+        assert!(embeddings.gather(&[0, 1], &cancellation).is_err());
+    }
+
     #[test]
     fn rotary_uses_two_halves_and_preserves_norm() {
         let device = Default::default();
@@ -698,6 +1067,46 @@ mod tests {
                     let expected = (0..inner)
                         .map(|k| {
                             left[(head * rows + row) * inner + k] * right[k * columns + column]
+                        })
+                        .sum::<f32>();
+                    let observed = actual[(head * rows + row) * columns + column];
+                    assert!((observed - expected).abs() <= 1e-5 + expected.abs() * 1e-5);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fp32_tiled_matmul_matches_transposed_weights_with_tails_and_head_broadcast() {
+        let device = Default::default();
+        let (heads, rows, inner, columns) = (2, 33, 129, 35);
+        let left = (0..heads * rows * inner)
+            .map(|i| (i % 23) as f32 / 23.0 - 0.5)
+            .collect::<Vec<_>>();
+        let weights = (0..columns * inner)
+            .map(|i| (i % 19) as f32 / 19.0 - 0.5)
+            .collect::<Vec<_>>();
+        let actual = matmul4(
+            Tensor::<Cpu, 4>::from_data(
+                TensorData::new(left.clone(), [1, heads, rows, inner]),
+                &device,
+            ),
+            Tensor::<Cpu, 4>::from_data(
+                TensorData::new(weights.clone(), [1, 1, columns, inner]),
+                &device,
+            )
+            .swap_dims(2, 3),
+            MatmulMode::Fp32Tiled,
+        )
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+        for head in 0..heads {
+            for row in 0..rows {
+                for column in 0..columns {
+                    let expected = (0..inner)
+                        .map(|k| {
+                            left[(head * rows + row) * inner + k] * weights[column * inner + k]
                         })
                         .sum::<f32>();
                     let observed = actual[(head * rows + row) * columns + column];
