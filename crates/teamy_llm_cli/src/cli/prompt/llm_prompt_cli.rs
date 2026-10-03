@@ -209,19 +209,27 @@ impl<W: Write> PromptObserver<'_, W> {
                     );
                     self.first_token = false;
                 }
+                // Empty tokens, whitespace and format controls do not qualify
+                // as the first visible model text. JSON records are emitted
+                // only after the complete result; this event records readiness.
+                // Log before writing so the diagnostic cannot split the first
+                // visible token from the rest of its streamed response.
+                let first_visible_ready = self.first_visible && has_visible_text(&text);
+                if first_visible_ready {
+                    tracing::info!(
+                        elapsed_ms = self.requested_at.elapsed().as_secs_f64() * 1000.0,
+                        streaming_to_stdout = self.stream_text,
+                        "first visible model text"
+                    );
+                }
                 if self.stream_text {
                     self.writer.write_all(text.as_bytes())?;
                     self.writer.flush()?;
                 }
-                // Empty tokens, whitespace and format controls do not qualify
-                // as the first visible model text. JSON records are emitted
-                // only after the complete result; this span records readiness.
-                if self.first_visible && has_visible_text(&text) {
-                    tracing::info!(
-                        elapsed_ms = self.requested_at.elapsed().as_secs_f64() * 1000.0,
-                        streamed_to_stdout = self.stream_text,
-                        "first visible model text"
-                    );
+                // A readiness diagnostic does not establish that output was
+                // delivered. Leave the state unchanged if writing or flushing
+                // fails, and propagate that failure to the caller.
+                if first_visible_ready {
                     self.first_visible = false;
                 }
             }
@@ -242,7 +250,65 @@ fn has_visible_text(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use teamy_llm_burn_qwen35::paths::{AppHome, CacheHome};
+
+    #[derive(Clone)]
+    struct RecordingSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RecordingSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn first_visible_diagnostic_precedes_streamed_text_in_a_shared_terminal_sink() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut output = RecordingSink(captured.clone());
+        let diagnostics = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || diagnostics.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut observer = PromptObserver {
+                writer: &mut output,
+                stream_text: true,
+                requested_at: Instant::now(),
+                first_token: true,
+                first_visible: true,
+            };
+            for (token_id, text) in [(1, "The"), (2, " sky appears blue.")] {
+                observer
+                    .observe(GenerateEvent::Token {
+                        token_id,
+                        text: text.into(),
+                    })
+                    .unwrap();
+            }
+        });
+
+        let captured = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        let first_token = captured.find("first generated token").unwrap();
+        let first_visible = captured.find("first visible model text").unwrap();
+        let text = captured.find("The sky appears blue.").unwrap();
+        assert!(first_token < first_visible);
+        assert!(first_visible < text);
+        assert!(captured[..text].ends_with('\n'));
+        assert!(captured[..text].contains("streaming_to_stdout=true"));
+        assert!(captured.ends_with("The sky appears blue."));
+        assert_eq!(captured.matches("first visible model text").count(), 1);
+    }
 
     #[test]
     fn named_orca_thinking_budget_matches_case_insensitive_inventory_selection() {
@@ -345,5 +411,34 @@ mod tests {
                 .is_err()
         );
         assert!(observer.first_visible);
+
+        struct Unflushed(Vec<u8>);
+        impl Write for Unflushed {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("cannot flush sink"))
+            }
+        }
+        let mut unflushed = Unflushed(Vec::new());
+        let mut observer = PromptObserver {
+            writer: &mut unflushed,
+            stream_text: true,
+            requested_at: Instant::now(),
+            first_token: true,
+            first_visible: true,
+        };
+        assert!(
+            observer
+                .observe(GenerateEvent::Token {
+                    token_id: 1,
+                    text: "x".into()
+                })
+                .is_err()
+        );
+        assert!(observer.first_visible);
+        assert_eq!(unflushed.0, b"x");
     }
 }
