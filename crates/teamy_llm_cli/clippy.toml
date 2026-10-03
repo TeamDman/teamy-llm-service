@@ -1,0 +1,9 @@
+# Policy, checks and scoped exceptions:
+# https://teamdman.github.io/teamy-docs/code-standards.html
+
+disallowed-macros = [
+    { path = "std::print", reason = "Send diagnostics through tracing; render command results into a caller-supplied std::io::Write sink." },
+    { path = "std::println", reason = "Send diagnostics through tracing; render command results into a caller-supplied std::io::Write sink." },
+    { path = "std::eprint", reason = "Send diagnostics through tracing so filters, log files and terminal ownership apply." },
+    { path = "std::eprintln", reason = "Send diagnostics through tracing so filters, log files and terminal ownership apply." },
+]

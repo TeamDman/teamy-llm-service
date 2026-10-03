@@ -1,5 +1,13 @@
 use std::process::Command;
 
+#[expect(
+    clippy::disallowed_macros,
+    reason = "Build-script stdout is Cargo's instruction protocol, not runtime logging"
+)]
+fn cargo_instruction(instruction: std::fmt::Arguments<'_>) {
+    println!("cargo:{instruction}");
+}
+
 fn git(args: &[&str]) -> String {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -18,27 +26,27 @@ fn git(args: &[&str]) -> String {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/index");
-    println!("cargo:rerun-if-changed=src");
-    println!(
-        "cargo:rustc-env=GIT_REVISION={}",
+    cargo_instruction(format_args!("rerun-if-changed=../../.git/HEAD"));
+    cargo_instruction(format_args!("rerun-if-changed=../../.git/index"));
+    cargo_instruction(format_args!("rerun-if-changed=src"));
+    cargo_instruction(format_args!(
+        "rustc-env=GIT_REVISION={}",
         git(&["rev-parse", "HEAD"])
-    );
-    println!(
-        "cargo:rustc-env=GIT_BRANCH={}",
+    ));
+    cargo_instruction(format_args!(
+        "rustc-env=GIT_BRANCH={}",
         git(&["branch", "--show-current"])
-    );
+    ));
     let status = git(&["status", "--porcelain"]);
-    println!(
-        "cargo:rustc-env=GIT_WORKTREE_STATUS={}",
+    cargo_instruction(format_args!(
+        "rustc-env=GIT_WORKTREE_STATUS={}",
         match status.as_str() {
             "" => "clean",
             "unknown" => "unknown",
             _ => "dirty",
         }
-    );
-    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    ));
+    cargo_instruction(format_args!("rerun-if-env-changed=SOURCE_DATE_EPOCH"));
     let timestamp = std::env::var("SOURCE_DATE_EPOCH")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -47,5 +55,5 @@ fn main() {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_secs())
         });
-    println!("cargo:rustc-env=BUILD_TIMESTAMP_UNIX={timestamp}");
+    cargo_instruction(format_args!("rustc-env=BUILD_TIMESTAMP_UNIX={timestamp}"));
 }

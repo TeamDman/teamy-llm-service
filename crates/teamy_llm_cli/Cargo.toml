@@ -43,3 +43,9 @@ vox.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 teamy_llm_burn_qwen35.workspace = true
+
+[lints.rust]
+unfulfilled_lint_expectations = "deny"
+
+[lints.clippy]
+disallowed_macros = "deny"
