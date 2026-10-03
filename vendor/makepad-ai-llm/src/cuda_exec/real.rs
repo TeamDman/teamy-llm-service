@@ -442,6 +442,9 @@ impl Drop for Arena {
 
 impl Runtime {
     pub(super) fn new() -> Result<Self> {
+        // Native host-launch diagnostics use this process-lifetime bridge so
+        // the application's subscriber controls filtering and output ownership.
+        makepad_ai_cuda::install_tracing_callback();
         unsafe {
             let mut count = 0;
             check(cudaGetDeviceCount(&mut count), "device count")?;
@@ -2307,8 +2310,9 @@ impl Compiled {
                 "graph recapture drain",
             )?;
             *self.graph_exec.borrow_mut() = None;
-            eprintln!(
-                "cuda.graph: device scratch moved since capture; re-capturing this shape"
+            tracing::debug!(
+                target: "teamy_llm_makepad_gguf::cuda::graph",
+                "Device scratch moved since capture; recapturing this shape"
             );
         }
         let t_launch = split.then(Instant::now);
@@ -2405,18 +2409,17 @@ impl Compiled {
                                 .collect();
                             glu_prev.push(prev);
                         }
-                        eprintln!(
-                            "cuda.graph: captured launched={} plan_nodes={} \
-                             fused_mmvq={} fused_rms={} fused_unary={} fused_ssm={} \
-                             extras={:?} glu_prev={:?}",
+                        tracing::debug!(
+                            target: "teamy_llm_makepad_gguf::cuda::graph",
                             launched,
-                            self.plan.nodes.len(),
-                            self.plan.fused_mmvq,
-                            self.plan.fused_rms,
-                            self.plan.fused_unary,
-                            self.plan.fused_ssm,
-                            extras,
-                            glu_prev
+                            plan_nodes = self.plan.nodes.len(),
+                            fused_mmvq = self.plan.fused_mmvq,
+                            fused_rms = self.plan.fused_rms,
+                            fused_unary = self.plan.fused_unary,
+                            fused_ssm = self.plan.fused_ssm,
+                            extras = ?extras,
+                            glu_prev = ?glu_prev,
+                            "CUDA graph captured"
                         );
                         // Record which scratch pointers this capture baked in,
                         // so a later realloc by another shape invalidates it.
@@ -2424,7 +2427,11 @@ impl Compiled {
                         *self.graph_exec.borrow_mut() = Some(exec);
                     }
                     Err(err) => {
-                        eprintln!("cuda.graph: capture failed ({err}); staying on eager dispatch");
+                        tracing::warn!(
+                            target: "teamy_llm_makepad_gguf::cuda::graph",
+                            error = %err,
+                            "CUDA graph capture failed; staying on eager dispatch"
+                        );
                         self.graph_disabled.set(true);
                         view.dispatch_all()?;
                     }

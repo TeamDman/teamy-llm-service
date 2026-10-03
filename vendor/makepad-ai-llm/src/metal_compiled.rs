@@ -1152,7 +1152,8 @@ pub fn create_context_main_buffer_no_copy(
         match unsafe { runtime.create_buffer_no_copy(arena) } {
             Ok(buffer) => return Ok(buffer),
             Err(err) => {
-                eprintln!("metal: no-copy weight buffer failed ({err}); falling back to copy");
+                tracing::warn!(target: "teamy_llm_makepad_gguf::metal", error = %err,
+                    "Metal no-copy weight buffer failed; falling back to copy");
             }
         }
     }
@@ -1345,13 +1346,12 @@ impl MetalGraphSession {
                 .main_buffer_size
                 .saturating_sub(ro_split)
                 .max(1);
-            eprintln!(
-                "metal: two-region session ro_split={} dirty_needed={} dirty_used={} arena={} cooldown={}",
-                ro_split,
-                dirty_needed,
-                ctx.used_mem().saturating_sub(ctx.ro_split()),
-                ctx.mem_buffer().len(),
-                reuse_cooldown()
+            tracing::debug!(
+                target: "teamy_llm_makepad_gguf::metal",
+                ro_split, dirty_needed,
+                dirty_used = ctx.used_mem().saturating_sub(ctx.ro_split()),
+                arena_bytes = ctx.mem_buffer().len(), cooldown = reuse_cooldown(),
+                "Metal two-region session prepared"
             );
             let main_buffer =
                 create_context_dirty_buffer(&runtime, ctx, dirty_needed, main_storage)?;

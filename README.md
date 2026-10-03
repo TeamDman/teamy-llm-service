@@ -254,6 +254,15 @@ Read-only sharing assumes immutable backing bytes and a stable model path; it do
 against privileged mutation or path retargeting. Measure cold-start latency separately from
 fresh clients using a prewarmed service.
 
+The vendored Makepad loader, LLM executor and CUDA store send routine runtime diagnostics
+through the application's `tracing` subscriber. Upload and graph summaries and native
+host-launch diagnostics use debug targets under `teamy_llm_makepad_gguf::cuda`;
+`--debug` includes them, while `--log-filter warn` hides successful profiling messages.
+Recoverable fallbacks and cleanup failures retain warning or error levels. Direct CLI
+`--log-file` output records these events as NDJSON; generated text remains on stdout.
+The native launcher bridge changes host logging only, preserving kernel mathematics and
+selection. Device assertions and failures in an external driver are outside this bridge.
+
 ## Performance baseline
 
 The benchmark command defaults to the fixed prompt `Why is the sky blue?`, a 200-token cap, and

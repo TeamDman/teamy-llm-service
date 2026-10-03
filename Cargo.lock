@@ -3844,9 +3844,9 @@ checksum = "670fdfda89751bc4a84ac13eaa63e205cf0fd22b4c9a5fbfa085b63c1f1d3a30"
 [[package]]
 name = "makepad-ai-cuda"
 version = "0.1.0"
-source = "git+https://github.com/makepad/makepad?rev=9e5e3d2b03214f8c2c37adffa0e308c815662060#9e5e3d2b03214f8c2c37adffa0e308c815662060"
 dependencies = [
  "makepad-ai-loader",
+ "tracing",
 ]
 
 [[package]]
@@ -3857,6 +3857,7 @@ dependencies = [
  "makepad-ai-loader",
  "makepad-ai-metal",
  "makepad-zune-png",
+ "tracing",
 ]
 
 [[package]]
@@ -3865,6 +3866,7 @@ version = "0.1.0"
 dependencies = [
  "makepad-micro-serde",
  "memmap2",
+ "tracing",
 ]
 
 [[package]]

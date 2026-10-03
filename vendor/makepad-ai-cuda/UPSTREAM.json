@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/makepad/makepad",
+  "revision": "9e5e3d2b03214f8c2c37adffa0e308c815662060",
+  "source_path": "libs/ai/cuda",
+  "license": "MIT",
+  "license_file": "LICENSE",
+  "notice_file": "NOTICE",
+  "attribution": "Unmodified Makepad repository LICENSE and libs/ai/NOTICE are retained. NOTICE describes the upstream AI stack; its CUDA ggml/llama.cpp sections apply to this copy. The existing kernels/llm/fattn/LICENSE remains unchanged.",
+  "patches": [
+    "Resolve the existing vendored makepad-ai-loader and workspace tracing dependency.",
+    "Route three host-only MMVQ/MMQ/flash-attention diagnostic print sites through a bounded process-lifetime C callback into Rust tracing DEBUG events.",
+    "Add model-free callback filtering, bounded UTF-8 decoding and unwind-containment tests."
+  ],
+  "unchanged_contract": "CUDA math, tensor layouts, kernel selection, launch arguments, stream pointers and compilation policy are unchanged."
+}

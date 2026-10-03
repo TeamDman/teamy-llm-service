@@ -79,7 +79,8 @@ pub fn read_placed(path: &Path, arena: &mut [u8], placed: &[Placement]) -> Resul
         // Any platform refusal (unsupported flags, odd filesystem) falls back
         // to the path that always works rather than failing the load.
         Err(err) => {
-            eprintln!("loader: bulk read fell back to sequential ({})", err);
+            tracing::warn!(target: "teamy_llm_makepad_gguf::loader", error = %err,
+                "Bulk model read fell back to sequential I/O");
             read_sequential(path, arena, placed)
         }
     }

@@ -6,6 +6,7 @@ description = "Backend-neutral model-weight disk layer: safetensors/GGUF/torch/n
 license = "MIT"
 
 [dependencies]
+tracing.workspace = true
 makepad-micro-serde = { git = "https://github.com/makepad/makepad", rev = "9e5e3d2b03214f8c2c37adffa0e308c815662060" }
 
 [target.'cfg(windows)'.dependencies]

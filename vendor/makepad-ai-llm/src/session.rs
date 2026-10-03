@@ -1467,11 +1467,11 @@ impl LlamaSession {
             None
         };
         if let Some(loaded) = draft_vocab.as_ref() {
-            eprintln!(
-                "llama: mtp draft head restricted to {} of {} tokens ({:.1}% corpus coverage)",
-                loaded.len(),
-                loaded.vocab_size,
-                loaded.coverage() * 100.0
+            tracing::debug!(
+                target: "teamy_llm_makepad_gguf::session",
+                draft_tokens = loaded.len(), vocab_size = loaded.vocab_size,
+                corpus_coverage_percent = loaded.coverage() * 100.0,
+                "MTP draft head restricted to the selected vocabulary"
             );
         }
         let mut spec_mtp = if draft_max > 0 {

@@ -137,7 +137,8 @@ impl GgufWeightLayout {
         let region = match MappedRegion::map_file(&gguf.path) {
             Ok(region) => Arc::new(region),
             Err(err) => {
-                eprintln!("llama: {} — using the owned-arena weight path", err);
+                tracing::warn!(target: "teamy_llm_makepad_gguf::weights", error = %err,
+                    "Weight mapping unavailable; using the owned-arena weight path");
                 return None;
             }
         };
@@ -145,7 +146,8 @@ impl GgufWeightLayout {
         match self.load_from_mapped_region(gguf, extra_bytes, region) {
             Ok(weights) => Some(weights),
             Err(err) => {
-                eprintln!("llama: cannot map weight layout ({err}) — using the owned-arena weight path");
+                tracing::warn!(target: "teamy_llm_makepad_gguf::weights", error = %err,
+                    "Cannot map weight layout; using the owned-arena weight path");
                 None
             }
         }
@@ -183,12 +185,11 @@ impl GgufWeightLayout {
             let seconds = started.elapsed().as_secs_f64();
             let gb = region.len() as f64 / (1u64 << 30) as f64;
             let (resident, pages) = region.residency();
-            eprintln!(
-                "llama: prefaulted {:.2} GB in {:.2} s ({:.2} GB/s, {:.1}% resident)",
-                gb,
-                seconds,
-                gb / seconds,
-                100.0 * resident as f64 / pages.max(1) as f64
+            tracing::debug!(
+                target: "teamy_llm_makepad_gguf::weights",
+                gib = gb, seconds, gib_per_second = gb / seconds,
+                resident_percent = 100.0 * resident as f64 / pages.max(1) as f64,
+                "Mapped model weights prefaulted"
             );
         }
 

@@ -11,6 +11,7 @@ members = [
     "crates/teamy_llm_cli",
     "vendor/makepad-ai-loader",
     "vendor/makepad-ai-llm",
+    "vendor/makepad-ai-cuda",
 ]
 
 [workspace.package]
@@ -67,6 +68,7 @@ futures-util = "=0.3.32"
 # the pinned Makepad graph while leaving their numerical implementations intact.
 [patch."https://github.com/makepad/makepad"]
 makepad-ai-loader = { path = "vendor/makepad-ai-loader" }
+makepad-ai-cuda = { path = "vendor/makepad-ai-cuda" }
 
 [profile.dev.package."*"]
 opt-level = 3

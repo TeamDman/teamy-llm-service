@@ -431,12 +431,14 @@ impl Drop for PinnedUpload<'_> {
                 // risk freeing host memory an unknown DMA operation still reads.
                 let device_error = unsafe { cudaDeviceSynchronize() };
                 if device_error != CUDA_SUCCESS {
-                    eprintln!(
-                        "cuda.upload: cannot drain pinned staging; retaining {} bytes until \
-                         CUDA teardown (stream={}, device={})",
-                        self.capacity * SLOT_COUNT,
-                        cuda_err_str(stream_error),
-                        cuda_err_str(device_error),
+                    tracing::error!(
+                        target: "teamy_llm_makepad_gguf::cuda::upload",
+                        retained_bytes = self.capacity * SLOT_COUNT,
+                        stream_error_code = stream_error,
+                        stream_error = %cuda_err_str(stream_error),
+                        device_error_code = device_error,
+                        device_error = %cuda_err_str(device_error),
+                        "Cannot drain pinned staging; retaining allocation until CUDA teardown"
                     );
                     return;
                 }
@@ -448,16 +450,23 @@ impl Drop for PinnedUpload<'_> {
                     if !event.is_null() {
                         let error = cudaEventDestroy(event);
                         if error != CUDA_SUCCESS {
-                            eprintln!("cuda.upload: event cleanup failed: {}", cuda_err_str(error));
+                            tracing::warn!(
+                                target: "teamy_llm_makepad_gguf::cuda::upload",
+                                error_code = error,
+                                error = %cuda_err_str(error),
+                                "Initial CUDA upload event cleanup failed"
+                            );
                         }
                     }
                 }
                 if !slot.host.is_null() {
                     let error = cudaFreeHost(slot.host);
                     if error != CUDA_SUCCESS {
-                        eprintln!(
-                            "cuda.upload: pinned cleanup failed: {}",
-                            cuda_err_str(error)
+                        tracing::warn!(
+                            target: "teamy_llm_makepad_gguf::cuda::upload",
+                            error_code = error,
+                            error = %cuda_err_str(error),
+                            "Initial CUDA upload pinned allocation cleanup failed"
                         );
                     }
                 }
@@ -502,30 +511,28 @@ pub(super) fn upload_arena(
     )?;
     upload.finish()?;
     let timing = &upload.timing;
-    eprintln!(
-        "cuda.upload: mode=pinned-pipeline bytes={} slots={} slot_bytes={} host_alloc_flags={} copy_threads={} \
-         device_alloc_ms={:.3} host_alloc_ms={:.3} cpu_staging_ms={:.3} \
-         ro_staged_bytes={} ro_cpu_staging_ms={:.3} dirty_staged_bytes={} dirty_cpu_staging_ms={:.3} \
-         enqueue_ms={:.3} completion_wait_ms={:.3} \
-         h2d_completed_event_ms={:.3} clear_enqueue_ms={:.3} final_sync_ms={:.3} upload_wall_ms={:.3}",
-        timing.uploaded_bytes,
-        SLOT_COUNT,
-        capacity,
-        upload.host_alloc_flags,
-        upload.copy_threads,
+    tracing::debug!(
+        target: "teamy_llm_makepad_gguf::cuda::upload",
+        mode = "pinned-pipeline",
+        bytes = timing.uploaded_bytes,
+        slots = SLOT_COUNT,
+        slot_bytes = capacity,
+        host_alloc_flags = upload.host_alloc_flags,
+        copy_threads = upload.copy_threads,
         device_alloc_ms,
-        timing.host_alloc_ms,
-        timing.cpu_staging_ms,
-        timing.ro_staged_bytes,
-        timing.ro_cpu_staging_ms,
-        timing.dirty_staged_bytes,
-        timing.dirty_cpu_staging_ms,
-        timing.enqueue_ms,
-        timing.completion_wait_ms,
-        timing.h2d_event_ms,
-        timing.clear_enqueue_ms,
-        timing.final_sync_ms,
-        started.elapsed().as_secs_f64() * 1000.0,
+        host_alloc_ms = timing.host_alloc_ms,
+        cpu_staging_ms = timing.cpu_staging_ms,
+        ro_staged_bytes = timing.ro_staged_bytes,
+        ro_cpu_staging_ms = timing.ro_cpu_staging_ms,
+        dirty_staged_bytes = timing.dirty_staged_bytes,
+        dirty_cpu_staging_ms = timing.dirty_cpu_staging_ms,
+        enqueue_ms = timing.enqueue_ms,
+        completion_wait_ms = timing.completion_wait_ms,
+        h2d_completed_event_ms = timing.h2d_event_ms,
+        clear_enqueue_ms = timing.clear_enqueue_ms,
+        final_sync_ms = timing.final_sync_ms,
+        upload_wall_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "Initial CUDA arena upload completed"
     );
     Ok(())
 }
