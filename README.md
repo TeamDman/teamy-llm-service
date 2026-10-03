@@ -45,12 +45,29 @@ This validates the tested cases, rather than establishing calibration or full-co
 
 ## Real decision models
 
-Supply version 1 JSON on stdin or with `--request '@choice.json'`. The request contains
-`input: {text, visuals: []}` and `options: [{id, content: {text, visuals: []}}]`.
-Use explicit local model locations; no command downloads weights implicitly.
+Supply text with `--prompt` and repeat `--choice` for each of 2–20 answers. The typed
+`choice: Vec<String>` preserves input order, and stdout contains one full-precision
+probability per choice in that order. Julia-1, native inference and CUDA are the text
+interface defaults. Add `--output-format json` for the complete versioned result.
 
 ```powershell
 teamy-llm decide --help
+teamy-llm decide --prompt "How to add structured logging to a Rust command-line application." --choice "Writing programs" --choice "Playing games" --choice "Managing photos"
+"A note about writing a Rust program" | teamy-llm decide --prompt - --choice "Writing programs" --choice "Playing games"
+```
+
+The short command uses the version 1 `julia-native-model.json` location record in the
+runtime configuration directory. Its `model-dir` must be an absolute path to already
+acquired native Julia artifacts. `--model-dir '<native-model-dir>'` overrides that record;
+missing or invalid configuration fails with guidance to supply the flag. The record is
+independent of the generation model's `default-model.json`. Neither inference nor location
+resolution downloads weights, searches directories or writes configuration.
+
+Existing version 1 `--request` JSON and JSON stdin callers retain their default JSON output.
+Keep request input separate from the text flags; ONNX requires an explicit model directory
+and runtime library:
+
+```powershell
 Get-Content choice.json -Raw | teamy-llm decide --provider native --model julia-1 --model-dir '<native-model-dir>' --device cuda
 teamy-llm decide --provider onnx --model julia-1 --model-dir '<onnx-model-dir>' --runtime-library '<onnxruntime.dll>' --device cuda --allow-cpu-fallback --request '@choice.json'
 ```
